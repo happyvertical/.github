@@ -25,11 +25,6 @@ on:
         required: false
         type: string
         default: ''
-      status_planning_id:
-        description: 'Status option ID for "Planning"'
-        required: false
-        type: string
-        default: ''
       status_in_progress_id:
         description: 'Status option ID for "In Progress"'
         required: false
@@ -115,151 +110,41 @@ jobs:
             echo "missing=" >> $GITHUB_OUTPUT
           fi
 
-  # PREPARE: If not ready, Claude will prepare the issue
-  prepare:
+  # NOT READY: Reject and remove label
+  not-ready:
     needs: check-readiness
-    if: needs.check-readiness.outputs.ready == 'false' && needs.check-readiness.outputs.missing != 'Issue is closed'
+    if: needs.check-readiness.outputs.ready == 'false'
     runs-on: arc-happyvertical
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Post Preparation Comment
+      - name: Post Not Ready Comment
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh issue comment ${{ inputs.issue_number }} --body "## Preparing Issue for Implementation
+          gh issue comment ${{ inputs.issue_number }} --body "## Issue Not Ready for Autopilot
 
-          This issue needs some preparation before I can implement it.
+          The \`agent: claude\` label is for **fully autonomous implementation only**.
 
-          **Missing**: ${{ needs.check-readiness.outputs.missing }}
+          This issue is missing: **${{ needs.check-readiness.outputs.missing }}**
 
-          I'll analyze the issue and:
-          - Add appropriate labels (type, priority, size)
-          - Clarify requirements if needed
-          - Create an implementation plan
+          ### To use autopilot:
+          1. Ensure the issue has \`type:\`, \`priority:\`, and \`size:\` labels
+          2. Provide a detailed description (50+ characters)
+          3. Re-apply the \`agent: claude\` label
+
+          ### Alternatives:
+          - **Run Issue Checkup** workflow to have Claude triage/prepare issues
+          - **Use \`@claude\`** in a comment for interactive assistance
+          - **Manually prepare** the issue, then re-apply the label
 
           ---
-          *Automated preparation by Claude*"
+          *Removing \`agent: claude\` label*"
 
-      - name: Run Claude Preparation
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          timeout_minutes: 12
-          prompt: |
-            REPO: ${{ github.repository }}
-            ISSUE_NUMBER: ${{ inputs.issue_number }}
-            MISSING: ${{ needs.check-readiness.outputs.missing }}
-
-            This issue has the `agent: claude` label but is not ready for implementation.
-            Your job is to PREPARE it so it can be implemented.
-
-            ## Step 1: Read and Understand
-
-            ```bash
-            gh issue view ${{ inputs.issue_number }}
-            ```
-
-            Read the issue thoroughly. Also read CLAUDE.md for repository context.
-
-            ## Step 2: Add Missing Labels
-
-            Based on the issue content, apply appropriate labels:
-
-            **Type** (choose one):
-            - `type: bug` - Something broken
-            - `type: feature` - New functionality
-            - `type: docs` - Documentation
-            - `type: maintenance` - Refactoring, cleanup
-            - `type: research` - Investigation needed
-
-            **Priority** (choose one):
-            - `priority: critical` - Urgent, blocking
-            - `priority: high` - Important
-            - `priority: medium` - Normal (default)
-            - `priority: low` - Nice to have
-
-            **Size** (choose one based on complexity):
-            - `size: xs` - < 2 hours, trivial
-            - `size: s` - 2-4 hours, small
-            - `size: m` - ~1 day, moderate
-            - `size: l` - 2-3 days, significant
-            - `size: xl` - > 3 days, large
-
-            Apply labels:
-            ```bash
-            gh issue edit ${{ inputs.issue_number }} --add-label "type: X,priority: Y,size: Z"
-            ```
-
-            ## Step 3: Clarify and Plan
-
-            If the issue description is vague or missing details, post a comment with:
-            1. Your understanding of what needs to be done
-            2. Any clarifying questions
-            3. A brief implementation plan
-
-            ## Step 4: Completion
-
-            Post a summary comment:
-            ```
-            ## Issue Prepared
-
-            **Labels Applied**: [list labels]
-            **Implementation Plan**: [brief plan]
-
-            This issue is now ready for implementation. The `agent: claude` label will trigger
-            the implementation phase automatically.
-
-            If you'd like me to proceed with implementation now, just comment "@claude implement this".
-            Otherwise, I'll wait for manual review.
-            ```
-
-            DO NOT start implementation yet - just prepare the issue.
-
-          allowed_tools: |
-            Bash(gh issue:*),Bash(gh search:*),Read,Grep,Glob
-
-      - name: Update Project Board to Planning
-        if: inputs.project_id != '' && inputs.status_planning_id != ''
+      - name: Remove Label
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          ISSUE_NODE_ID=$(gh api graphql -f query='
-            query($owner: String!, $repo: String!, $number: Int!) {
-              repository(owner: $owner, name: $repo) {
-                issue(number: $number) {
-                  id
-                  projectItems(first: 10) {
-                    nodes {
-                      id
-                      project { id }
-                    }
-                  }
-                }
-              }
-            }
-          ' -f owner="${{ github.repository_owner }}" -f repo="${{ github.event.repository.name }}" -F number=${{ inputs.issue_number }} --jq '.data.repository.issue')
-
-          ITEM_ID=$(echo "$ISSUE_NODE_ID" | jq -r ".projectItems.nodes[] | select(.project.id == \"${{ inputs.project_id }}\") | .id" 2>/dev/null || echo "")
-
-          if [ -n "$ITEM_ID" ]; then
-            gh api graphql -f query='
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                updateProjectV2ItemFieldValue(input: {
-                  projectId: $projectId
-                  itemId: $itemId
-                  fieldId: $fieldId
-                  value: { singleSelectOptionId: $optionId }
-                }) {
-                  projectV2Item { id }
-                }
-              }
-            ' -f projectId="${{ inputs.project_id }}" -f itemId="$ITEM_ID" -f fieldId="${{ inputs.status_field_id }}" -f optionId="${{ inputs.status_planning_id }}" || true
-          fi
+          gh issue edit ${{ inputs.issue_number }} --remove-label "agent: claude"
 
   # IMPLEMENT: If ready, Claude implements the issue
   implement:

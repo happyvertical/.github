@@ -104,13 +104,12 @@ Analyzes test failures:
 
 ### Agent Autopilot (`org-agent-autopilot.yml`)
 
-Full implementation automation triggered by `agent: claude` label:
-1. Validates Definition of Ready
-2. Creates feature branch
-3. Implements the solution
-4. Runs quality checks
-5. Creates pull request
-6. Updates issue status
+Full **autonomous implementation** triggered by `agent: claude` label:
+1. Validates Definition of Ready (type, priority, size labels + description)
+2. If not ready: **rejects and removes label** with helpful comment
+3. If ready: Creates feature branch, implements, runs quality checks, creates PR
+
+**Important**: This is for fully autonomous implementation only. Use Issue Checkup or `@claude` mentions for issue preparation/triage.
 
 ### Issue Checkup (`org-issue-checkup.yml`)
 
