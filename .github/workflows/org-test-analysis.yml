@@ -1,0 +1,113 @@
+name: Org Test Failure Analysis
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: 'Workflow run ID with test failures'
+        required: true
+        type: number
+      workflow_name:
+        description: 'Name of the test workflow'
+        required: false
+        type: string
+        default: ''
+      pr_number:
+        description: 'PR number if from a PR'
+        required: false
+        type: number
+        default: 0
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+      GH_TOKEN:
+        description: 'GitHub token for API access'
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+  id-token: write
+
+jobs:
+  analyze:
+    runs-on: arc-happyvertical
+    timeout-minutes: 10
+    outputs:
+      analysis: ${{ steps.analyze.outputs.result }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Test Logs
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "Fetching test logs for run ${{ inputs.run_id }}..."
+          gh run view ${{ inputs.run_id }} --log > test_run_logs.txt 2>&1 || true
+          gh run view ${{ inputs.run_id }} --log-failed > test_failed_logs.txt 2>&1 || true
+          gh run view ${{ inputs.run_id }} --json jobs,conclusion > run_info.json 2>&1 || true
+
+          echo "=== Failed logs preview ==="
+          head -200 test_failed_logs.txt || true
+
+      - name: Download Test Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          path: test-artifacts
+          github-token: ${{ secrets.GH_TOKEN }}
+        continue-on-error: true
+
+      - name: Analyze with Claude
+        id: analyze
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          timeout_minutes: 8
+          prompt: |
+            REPO: ${{ github.repository }}
+            RUN_ID: ${{ inputs.run_id }}
+            WORKFLOW: ${{ inputs.workflow_name }}
+            PR_NUMBER: ${{ inputs.pr_number }}
+
+            Analyze the test failures and provide structured output.
+
+            Read the logs:
+            - test_failed_logs.txt - Failed test output
+            - test_run_logs.txt - Full run logs
+            - run_info.json - Run metadata
+            - test-artifacts/ - Any downloaded test artifacts
+
+            Execute the analyze-tests command:
+            /analyze-tests
+
+            After analysis, if PR_NUMBER is set, post a comment with your findings:
+            gh pr comment $PR_NUMBER --body "[your analysis]"
+
+          allowed_tools: |
+            Read,Grep,Glob,Bash(gh pr:*),Bash(gh issue:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(tail:*)
+
+      - name: Check for Flaky Tests
+        id: flaky
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          # Get recent run history to detect patterns
+          gh run list --workflow="${{ inputs.workflow_name }}" --limit 10 --json conclusion,createdAt,headBranch > run_history.json 2>/dev/null || echo "[]" > run_history.json
+
+          # Count recent failures
+          FAILURES=$(jq '[.[] | select(.conclusion == "failure")] | length' run_history.json)
+          TOTAL=$(jq 'length' run_history.json)
+
+          echo "Recent failures: $FAILURES / $TOTAL runs"
+
+          if [ "$FAILURES" -gt 3 ] && [ "$TOTAL" -gt 5 ]; then
+            echo "Warning: High failure rate detected - potential flaky tests"
+            echo "flaky_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "flaky_detected=false" >> $GITHUB_OUTPUT
+          fi

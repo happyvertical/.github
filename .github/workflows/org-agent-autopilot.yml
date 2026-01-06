@@ -1,0 +1,277 @@
+name: Org Agent Autopilot
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: 'Issue number to implement'
+        required: true
+        type: number
+      action:
+        description: 'Label action (labeled or unlabeled)'
+        required: true
+        type: string
+      label_name:
+        description: 'Label that triggered this workflow'
+        required: true
+        type: string
+      project_id:
+        description: 'GitHub Projects board ID'
+        required: false
+        type: string
+        default: ''
+      status_field_id:
+        description: 'Status field ID in project'
+        required: false
+        type: string
+        default: ''
+      status_in_progress_id:
+        description: 'Status option ID for "In Progress"'
+        required: false
+        type: string
+        default: ''
+      status_review_id:
+        description: 'Status option ID for "Review"'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+      GH_TOKEN:
+        description: 'GitHub token for API access'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: autopilot-${{ github.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false  # Don't cancel ongoing work
+
+jobs:
+  validate:
+    if: inputs.action == 'labeled' && inputs.label_name == 'agent: claude'
+    runs-on: arc-happyvertical
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - name: Check Definition of Ready
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "Checking Definition of Ready for issue #${{ inputs.issue_number }}..."
+
+          ISSUE=$(gh issue view ${{ inputs.issue_number }} --json labels,body,title,state)
+
+          STATE=$(echo "$ISSUE" | jq -r '.state')
+          if [ "$STATE" != "OPEN" ]; then
+            echo "ready=false" >> $GITHUB_OUTPUT
+            echo "reason=Issue is not open (state: $STATE)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          LABELS=$(echo "$ISSUE" | jq -r '.labels[].name')
+
+          HAS_TYPE=$(echo "$LABELS" | grep -c "^type:" || true)
+          HAS_PRIORITY=$(echo "$LABELS" | grep -c "^priority:" || true)
+          HAS_SIZE=$(echo "$LABELS" | grep -c "^size:" || true)
+
+          BODY_LENGTH=$(echo "$ISSUE" | jq '.body | length')
+          TITLE_LENGTH=$(echo "$ISSUE" | jq '.title | length')
+
+          MISSING=""
+          if [ "$HAS_TYPE" -eq 0 ]; then
+            MISSING="$MISSING type label,"
+          fi
+          if [ "$HAS_PRIORITY" -eq 0 ]; then
+            MISSING="$MISSING priority label,"
+          fi
+          if [ "$HAS_SIZE" -eq 0 ]; then
+            MISSING="$MISSING size label,"
+          fi
+          if [ "$BODY_LENGTH" -lt 50 ]; then
+            MISSING="$MISSING description (need 50+ chars, have $BODY_LENGTH),"
+          fi
+
+          if [ -n "$MISSING" ]; then
+            echo "ready=false" >> $GITHUB_OUTPUT
+            echo "reason=Missing: ${MISSING%,}" >> $GITHUB_OUTPUT
+          else
+            echo "ready=true" >> $GITHUB_OUTPUT
+            echo "reason=All criteria met" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Validation Comment
+        if: steps.check.outputs.ready == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh issue comment ${{ inputs.issue_number }} --body "## Autopilot Validation Failed
+
+          This issue is not ready for automated implementation.
+
+          **Missing**: ${{ steps.check.outputs.reason }}
+
+          Please ensure the issue has:
+          - [ ] A \`type:\` label (bug, feature, docs, maintenance, research)
+          - [ ] A \`priority:\` label (critical, high, medium, low, icebox)
+          - [ ] A \`size:\` label (xs, s, m, l, xl)
+          - [ ] A description with at least 50 characters
+
+          Removing the \`agent: claude\` label. Re-add it once the issue is ready.
+
+          ---
+          *Automated validation by Claude*"
+
+          gh issue edit ${{ inputs.issue_number }} --remove-label "agent: claude"
+
+  autopilot:
+    needs: validate
+    if: needs.validate.outputs.ready == 'true'
+    runs-on: arc-happyvertical
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            pnpm install --frozen-lockfile
+          elif [ -f "package-lock.json" ]; then
+            npm ci
+          elif [ -f "package.json" ]; then
+            pnpm install || npm install
+          fi
+        continue-on-error: true
+
+      - name: Post Start Comment
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh issue comment ${{ inputs.issue_number }} --body "## Autopilot Started
+
+          I'm beginning work on this issue. Progress updates will be posted here.
+
+          **Status**: In Progress
+          **Started**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          ---
+          *Automated implementation by Claude*"
+
+      - name: Update Project Board Status
+        if: inputs.project_id != '' && inputs.status_in_progress_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          # Get issue node ID and project item ID
+          ISSUE_NODE_ID=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                  id
+                  projectItems(first: 10) {
+                    nodes {
+                      id
+                      project {
+                        id
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f owner="${{ github.repository_owner }}" -f repo="${{ github.event.repository.name }}" -F number=${{ inputs.issue_number }} --jq '.data.repository.issue')
+
+          ITEM_ID=$(echo "$ISSUE_NODE_ID" | jq -r ".projectItems.nodes[] | select(.project.id == \"${{ inputs.project_id }}\") | .id" 2>/dev/null || echo "")
+
+          if [ -n "$ITEM_ID" ]; then
+            gh api graphql -f query='
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $fieldId
+                  value: { singleSelectOptionId: $optionId }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            ' -f projectId="${{ inputs.project_id }}" -f itemId="$ITEM_ID" -f fieldId="${{ inputs.status_field_id }}" -f optionId="${{ inputs.status_in_progress_id }}" || true
+          fi
+
+      - name: Run Claude Autopilot
+        id: implement
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          timeout_minutes: 55
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            ISSUE_NUMBER: ${{ inputs.issue_number }}
+
+            You are implementing issue #${{ inputs.issue_number }} autonomously.
+
+            Execute the implement-issue command:
+            /implement-issue
+
+            Important workflow:
+            1. Read the issue: gh issue view ${{ inputs.issue_number }}
+            2. Read CLAUDE.md for repository guidelines
+            3. Create a feature branch: git checkout -b feat/issue-${{ inputs.issue_number }}-[description]
+            4. Implement the solution following existing patterns
+            5. Write/update tests
+            6. Run quality checks: pnpm typecheck && pnpm lint && pnpm test && pnpm build
+            7. Commit with: git commit -m "feat(scope): description\n\nCloses #${{ inputs.issue_number }}"
+            8. Push: git push -u origin [branch]
+            9. Create PR: gh pr create --title "..." --body "..."
+            10. Post completion comment on the issue
+
+            If you cannot proceed, post a comment explaining why and consider removing the agent: claude label.
+
+          allowed_tools: |
+            Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
+
+      - name: Post Failure Comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh issue comment ${{ inputs.issue_number }} --body "## Autopilot Failed
+
+          I encountered an error while implementing this issue.
+
+          Please check the [workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+
+          The \`agent: claude\` label has been kept - you may want to remove it and try again after addressing any issues.
+
+          ---
+          *Automated implementation by Claude*"

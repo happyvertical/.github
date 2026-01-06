@@ -1,0 +1,117 @@
+# Claude Mention Handler
+#
+# Copy this file to your repository's .github/workflows/on-mention.yml
+#
+# Required org secrets:
+#   - CLAUDE_CODE_OAUTH_TOKEN
+
+name: Claude Mention
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  # Handle @claude mentions in issue comments
+  issue-comment:
+    if: |
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude')
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: issue_comment
+      number: ${{ github.event.issue.number }}
+      comment_id: ${{ github.event.comment.id }}
+      is_pr: false
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Handle @claude mentions in PR comments
+  pr-comment:
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude')
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: pr_comment
+      number: ${{ github.event.issue.number }}
+      comment_id: ${{ github.event.comment.id }}
+      is_pr: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Handle @claude mentions in PR review comments
+  pr-review-comment:
+    if: |
+      github.event_name == 'pull_request_review_comment' &&
+      contains(github.event.comment.body, '@claude')
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: pr_review_comment
+      number: ${{ github.event.pull_request.number }}
+      comment_id: ${{ github.event.comment.id }}
+      is_pr: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Handle @claude mentions in PR reviews
+  pr-review:
+    if: |
+      github.event_name == 'pull_request_review' &&
+      contains(github.event.review.body, '@claude')
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: pr_review
+      number: ${{ github.event.pull_request.number }}
+      is_pr: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Handle @claude mentions in new issues
+  issue-opened:
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'opened' &&
+      contains(github.event.issue.body, '@claude')
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: issue
+      number: ${{ github.event.issue.number }}
+      is_pr: false
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Handle issues assigned to claude
+  issue-assigned:
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'assigned' &&
+      github.event.assignee.login == 'claude[bot]'
+    uses: happyvertical/.github/.github/workflows/org-claude-mention.yml@main
+    with:
+      trigger_type: issue
+      number: ${{ github.event.issue.number }}
+      is_pr: false
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

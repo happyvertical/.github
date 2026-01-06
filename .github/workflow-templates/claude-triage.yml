@@ -1,0 +1,44 @@
+# Claude Issue Triage
+#
+# Copy this file to your repository's .github/workflows/on-issue-opened.yml
+# Configure the repository variables as needed.
+#
+# Required org secrets:
+#   - CLAUDE_CODE_OAUTH_TOKEN
+#
+# Optional repository variables:
+#   - REPO_DESCRIPTION: Brief description of the repository
+#   - PACKAGE_PATTERN: Package naming pattern (e.g., @happyvertical/*)
+#   - PROJECT_ID: GitHub Projects board ID (PVT_xxx)
+#   - STATUS_FIELD_ID: Status field ID (PVTSSF_xxx)
+#   - STATUS_NEW_ID: Status option ID for "New"
+#   - STATUS_BACKLOG_ID: Status option ID for "Backlog"
+
+name: Issue Opened
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+  id-token: write
+
+jobs:
+  triage:
+    uses: happyvertical/.github/.github/workflows/org-issue-triage.yml@main
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      issue_title: ${{ github.event.issue.title }}
+      issue_body: ${{ github.event.issue.body || '' }}
+      issue_author: ${{ github.event.issue.user.login }}
+      repo_description: ${{ vars.REPO_DESCRIPTION || '' }}
+      package_pattern: ${{ vars.PACKAGE_PATTERN || '' }}
+      project_id: ${{ vars.PROJECT_ID || '' }}
+      status_field_id: ${{ vars.STATUS_FIELD_ID || '' }}
+      status_new_id: ${{ vars.STATUS_NEW_ID || '' }}
+      status_backlog_id: ${{ vars.STATUS_BACKLOG_ID || '' }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

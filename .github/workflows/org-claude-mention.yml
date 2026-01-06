@@ -1,0 +1,80 @@
+name: Org Claude Mention Handler
+
+on:
+  workflow_call:
+    inputs:
+      trigger_type:
+        description: 'Type of trigger (issue_comment, pr_comment, pr_review, issue)'
+        required: true
+        type: string
+      number:
+        description: 'Issue or PR number'
+        required: true
+        type: number
+      comment_id:
+        description: 'Comment ID (if triggered by comment)'
+        required: false
+        type: number
+        default: 0
+      is_pr:
+        description: 'Whether this is a PR (not an issue)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+      GH_TOKEN:
+        description: 'GitHub token for API access'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: claude-mention-${{ github.repository }}-${{ inputs.number }}
+  cancel-in-progress: true
+
+jobs:
+  handle-mention:
+    runs-on: arc-happyvertical
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            pnpm install --frozen-lockfile
+          elif [ -f "package-lock.json" ]; then
+            npm ci
+          elif [ -f "package.json" ]; then
+            pnpm install || npm install
+          fi
+        continue-on-error: true
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          timeout_minutes: 25
+          allowed_tools: |
+            Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*)

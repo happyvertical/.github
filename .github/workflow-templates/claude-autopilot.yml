@@ -1,0 +1,42 @@
+# Claude Agent Autopilot
+#
+# Copy this file to your repository's .github/workflows/on-label-changed.yml
+#
+# Required org secrets:
+#   - CLAUDE_CODE_OAUTH_TOKEN
+#
+# Optional repository variables:
+#   - PROJECT_ID: GitHub Projects board ID (PVT_xxx)
+#   - STATUS_FIELD_ID: Status field ID (PVTSSF_xxx)
+#   - STATUS_IN_PROGRESS_ID: Status option ID for "In Progress"
+#   - STATUS_REVIEW_ID: Status option ID for "Review"
+
+name: Label Changed
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  # Trigger autopilot when agent: claude label is added
+  autopilot:
+    if: github.event.label.name == 'agent: claude'
+    uses: happyvertical/.github/.github/workflows/org-agent-autopilot.yml@main
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      action: ${{ github.event.action }}
+      label_name: ${{ github.event.label.name }}
+      project_id: ${{ vars.PROJECT_ID || '' }}
+      status_field_id: ${{ vars.STATUS_FIELD_ID || '' }}
+      status_in_progress_id: ${{ vars.STATUS_IN_PROGRESS_ID || '' }}
+      status_review_id: ${{ vars.STATUS_REVIEW_ID || '' }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

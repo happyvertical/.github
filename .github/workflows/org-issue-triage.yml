@@ -1,0 +1,166 @@
+name: Org Issue Triage
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: 'Issue number to triage'
+        required: true
+        type: number
+      issue_title:
+        description: 'Issue title'
+        required: true
+        type: string
+      issue_body:
+        description: 'Issue body'
+        required: false
+        type: string
+        default: ''
+      issue_author:
+        description: 'Issue author'
+        required: true
+        type: string
+      repo_description:
+        description: 'Repository description for context'
+        required: false
+        type: string
+        default: ''
+      package_pattern:
+        description: 'Package naming pattern (e.g., @happyvertical/*)'
+        required: false
+        type: string
+        default: ''
+      project_id:
+        description: 'GitHub Projects board ID (PVT_xxx)'
+        required: false
+        type: string
+        default: ''
+      status_field_id:
+        description: 'Status field ID in project (PVTSSF_xxx)'
+        required: false
+        type: string
+        default: ''
+      status_new_id:
+        description: 'Status option ID for "New"'
+        required: false
+        type: string
+        default: ''
+      status_backlog_id:
+        description: 'Status option ID for "Backlog"'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+      GH_TOKEN:
+        description: 'GitHub token for API access'
+        required: true
+
+permissions:
+  issues: write
+  contents: read
+  id-token: write
+
+jobs:
+  triage:
+    runs-on: arc-happyvertical
+    timeout-minutes: 10
+    steps:
+      - name: Checkout org .github repository
+        uses: actions/checkout@v4
+        with:
+          repository: happyvertical/.github
+          path: org-github
+
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Run Claude Triage
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          timeout_minutes: 8
+          prompt: |
+            REPO: ${{ github.repository }}
+            REPO_DESCRIPTION: ${{ inputs.repo_description }}
+            PACKAGE_PATTERN: ${{ inputs.package_pattern }}
+            ISSUE_NUMBER: ${{ inputs.issue_number }}
+            ISSUE_TITLE: ${{ inputs.issue_title }}
+            ISSUE_AUTHOR: ${{ inputs.issue_author }}
+
+            Read the triage command instructions and execute them:
+            /label-issue
+
+            Additional context:
+            - Issue body is available via `gh issue view ${{ inputs.issue_number }}`
+            - Working directory is `repo/` which contains the calling repository
+            - Check for duplicates in this repository
+
+          allowed_tools: |
+            Bash(gh issue:*),Bash(gh search:*),Bash(gh api:*),Read,Grep,Glob
+
+      - name: Add to Project Board
+        if: inputs.project_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          STATUS_FIELD_ID: ${{ inputs.status_field_id }}
+          STATUS_BACKLOG_ID: ${{ inputs.status_backlog_id }}
+        run: |
+          cd repo
+
+          # Get issue node ID
+          ISSUE_NODE_ID=$(gh api graphql -f query='
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                  id
+                }
+              }
+            }
+          ' -f owner="${{ github.repository_owner }}" -f repo="${{ github.event.repository.name }}" -F number=${{ inputs.issue_number }} --jq '.data.repository.issue.id')
+
+          if [ -z "$ISSUE_NODE_ID" ]; then
+            echo "Could not get issue node ID"
+            exit 0
+          fi
+
+          # Add to project
+          ITEM_ID=$(gh api graphql -f query='
+            mutation($projectId: ID!, $contentId: ID!) {
+              addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                item {
+                  id
+                }
+              }
+            }
+          ' -f projectId="$PROJECT_ID" -f contentId="$ISSUE_NODE_ID" --jq '.data.addProjectV2ItemById.item.id' 2>/dev/null || echo "")
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "Issue may already be in project or could not be added"
+            exit 0
+          fi
+
+          # Set status to Backlog
+          if [ -n "$STATUS_FIELD_ID" ] && [ -n "$STATUS_BACKLOG_ID" ]; then
+            gh api graphql -f query='
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $fieldId
+                  value: { singleSelectOptionId: $optionId }
+                }) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            ' -f projectId="$PROJECT_ID" -f itemId="$ITEM_ID" -f fieldId="$STATUS_FIELD_ID" -f optionId="$STATUS_BACKLOG_ID"
+          fi
+
+          echo "Added issue #${{ inputs.issue_number }} to project board"
