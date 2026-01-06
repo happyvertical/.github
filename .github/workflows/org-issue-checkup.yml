@@ -1,0 +1,206 @@
+name: Org Issue Checkup
+
+on:
+  workflow_call:
+    inputs:
+      max_issues:
+        description: 'Maximum number of issues to process'
+        required: false
+        type: number
+        default: 20
+      stale_days:
+        description: 'Days before an untriaged issue is considered stale'
+        required: false
+        type: number
+        default: 7
+      project_id:
+        description: 'GitHub Projects board ID'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+      GH_TOKEN:
+        description: 'GitHub token for API access'
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  find-issues:
+    runs-on: arc-happyvertical
+    timeout-minutes: 5
+    outputs:
+      issues: ${{ steps.scan.outputs.issues }}
+      count: ${{ steps.scan.outputs.count }}
+    steps:
+      - name: Scan for Issues Needing Attention
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "Scanning for issues needing attention..."
+
+          # Get all open issues
+          ISSUES=$(gh issue list --state open --limit 100 --json number,title,labels,createdAt,body)
+
+          # Find issues missing required labels or with short descriptions
+          NEEDS_ATTENTION=$(echo "$ISSUES" | jq -c '[.[] | select(
+            # Missing type label
+            ([.labels[].name | select(startswith("type:"))] | length) == 0 or
+            # Missing priority label
+            ([.labels[].name | select(startswith("priority:"))] | length) == 0 or
+            # Missing size label
+            ([.labels[].name | select(startswith("size:"))] | length) == 0 or
+            # Short description (less than 50 chars)
+            ((.body // "") | length) < 50
+          )] | .[0:${{ inputs.max_issues }}]')
+
+          COUNT=$(echo "$NEEDS_ATTENTION" | jq 'length')
+
+          echo "Found $COUNT issues needing attention"
+          echo "issues=$(echo $NEEDS_ATTENTION | jq -c '.')" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+  checkup:
+    needs: find-issues
+    if: needs.find-issues.outputs.count != '0'
+    runs-on: arc-happyvertical
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Post Checkup Summary
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "## Issue Checkup Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Found **${{ needs.find-issues.outputs.count }}** issues needing attention." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Processing with Claude..." >> $GITHUB_STEP_SUMMARY
+
+      - name: Run Claude Issue Checkup
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          timeout_minutes: 25
+          prompt: |
+            REPO: ${{ github.repository }}
+            STALE_DAYS: ${{ inputs.stale_days }}
+
+            You are performing a scheduled issue checkup/hygiene scan.
+
+            ## Issues Needing Attention
+
+            The following issues need review:
+            ```json
+            ${{ needs.find-issues.outputs.issues }}
+            ```
+
+            ## Your Tasks
+
+            For EACH issue above:
+
+            ### 1. Read the Issue
+            ```bash
+            gh issue view <number>
+            ```
+
+            ### 2. Analyze What's Missing
+
+            Check for:
+            - **Type label**: bug, feature, docs, maintenance, research, question
+            - **Priority label**: critical, high, medium, low, icebox
+            - **Size label**: xs, s, m, l, xl
+            - **Description quality**: Is it clear what needs to be done?
+
+            ### 3. Add Missing Labels
+
+            If you can determine the appropriate labels from the issue content, add them:
+            ```bash
+            gh issue edit <number> --add-label "type: X,priority: Y,size: Z"
+            ```
+
+            ### 4. Add "needs-info" Label If Unclear
+
+            If the issue lacks enough information to determine labels or next steps:
+            ```bash
+            gh issue edit <number> --add-label "needs-info"
+            ```
+
+            ### 5. Post a Helpful Comment
+
+            For issues that need human input, post a comment like:
+            ```
+            ## Issue Checkup
+
+            This issue was flagged during our scheduled review.
+
+            **Status**: [what's missing or unclear]
+
+            **To move forward**, please:
+            - [specific ask 1]
+            - [specific ask 2]
+
+            Once updated, remove the `needs-info` label and the issue will be ready for work.
+
+            ---
+            *Automated checkup by Claude*
+            ```
+
+            ## Important Rules
+
+            - DO NOT implement anything - this is checkup only
+            - DO NOT add `agent: claude` label
+            - DO NOT create branches or PRs
+            - Be helpful and specific in comments
+            - Skip issues that already have all required labels AND adequate description
+            - If an issue is fine, don't comment on it
+
+            ## Summary
+
+            After processing all issues, output a summary:
+            - How many issues were updated
+            - How many need human attention (needs-info)
+            - How many were already fine
+
+          allowed_tools: |
+            Bash(gh issue:*),Bash(gh search:*),Read,Grep,Glob
+
+  report:
+    needs: [find-issues, checkup]
+    if: always() && needs.find-issues.outputs.count != '0'
+    runs-on: arc-happyvertical
+    timeout-minutes: 5
+    steps:
+      - name: Generate Report
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "## Issue Checkup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Processed ${{ needs.find-issues.outputs.count }} issues." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View the checkup job logs for details." >> $GITHUB_STEP_SUMMARY
+
+  no-issues:
+    needs: find-issues
+    if: needs.find-issues.outputs.count == '0'
+    runs-on: arc-happyvertical
+    timeout-minutes: 1
+    steps:
+      - name: Report Clean State
+        run: |
+          echo "## Issue Checkup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All issues are properly triaged. No action needed." >> $GITHUB_STEP_SUMMARY

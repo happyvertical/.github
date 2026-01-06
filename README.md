@@ -6,6 +6,7 @@ This repository contains organization-wide GitHub configuration, reusable workfl
 
 The HappyVertical organization uses Claude Code Action for automated:
 - **Issue triage** - Categorize, prioritize, and size new issues
+- **Issue checkup** - Scheduled hygiene scan to catch issues needing attention
 - **@claude mentions** - AI assistance in issues and PRs
 - **CI failure auto-fix** - Automatically fix failing CI builds
 - **Test failure analysis** - Analyze and detect flaky tests
@@ -111,6 +112,38 @@ Full implementation automation triggered by `agent: claude` label:
 5. Creates pull request
 6. Updates issue status
 
+### Issue Checkup (`org-issue-checkup.yml`)
+
+Scheduled hygiene workflow to catch issues that slipped through triage:
+- Runs weekly (configurable) or on-demand via manual trigger
+- Scans all open issues for missing labels or incomplete descriptions
+- Adds `needs-info` label to issues requiring human input
+- Claude comments with specific asks to move issues forward
+- Non-destructive: never implements, only triages and flags
+
+**Caller example:**
+```yaml
+name: Issue Checkup
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Weekly on Mondays
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: 'Maximum issues to process'
+        default: '20'
+
+jobs:
+  checkup:
+    uses: happyvertical/.github/.github/workflows/org-issue-checkup.yml@main
+    with:
+      max_issues: ${{ github.event.inputs.max_issues && fromJSON(github.event.inputs.max_issues) || 20 }}
+      stale_days: 7
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
 ## Claude Commands
 
 The `.claude/commands/` directory contains prompts for Claude:
@@ -153,6 +186,9 @@ The `.claude/commands/` directory contains prompts for Claude:
 - `agent: implementation` - AI implementation in progress
 - `agent: testing` - AI testing in progress
 - `agent: review` - AI code review in progress
+
+### Status Labels
+- `needs-info` - Issue needs more information before it can be worked on
 
 ## Kanban Board Integration
 
