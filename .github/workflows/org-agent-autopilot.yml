@@ -55,126 +55,51 @@ concurrency:
   cancel-in-progress: false  # Don't cancel ongoing work
 
 jobs:
-  # Check if issue is ready for implementation
-  check-readiness:
+  implement:
     if: inputs.action == 'labeled' && inputs.label_name == 'agent: claude'
     runs-on: arc-happyvertical
-    timeout-minutes: 5
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-      missing: ${{ steps.check.outputs.missing }}
+    timeout-minutes: 60
     steps:
-      - name: Check Definition of Ready
+      - name: Check Issue State
         id: check
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          echo "Checking Definition of Ready for issue #${{ inputs.issue_number }}..."
-
-          ISSUE=$(gh issue view ${{ inputs.issue_number }} --json labels,body,title,state)
-
-          STATE=$(echo "$ISSUE" | jq -r '.state')
+          STATE=$(gh issue view ${{ inputs.issue_number }} --json state --jq '.state')
           if [ "$STATE" != "OPEN" ]; then
-            echo "ready=false" >> $GITHUB_OUTPUT
-            echo "missing=Issue is closed" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          LABELS=$(echo "$ISSUE" | jq -r '.labels[].name' 2>/dev/null || echo "")
-
-          HAS_TYPE=$(echo "$LABELS" | grep -c "^type:" || true)
-          HAS_PRIORITY=$(echo "$LABELS" | grep -c "^priority:" || true)
-          HAS_SIZE=$(echo "$LABELS" | grep -c "^size:" || true)
-
-          BODY_LENGTH=$(echo "$ISSUE" | jq '.body | length // 0')
-
-          MISSING=""
-          if [ "$HAS_TYPE" -eq 0 ]; then
-            MISSING="${MISSING}type label, "
-          fi
-          if [ "$HAS_PRIORITY" -eq 0 ]; then
-            MISSING="${MISSING}priority label, "
-          fi
-          if [ "$HAS_SIZE" -eq 0 ]; then
-            MISSING="${MISSING}size label, "
-          fi
-          if [ "$BODY_LENGTH" -lt 50 ]; then
-            MISSING="${MISSING}detailed description, "
-          fi
-
-          if [ -n "$MISSING" ]; then
-            echo "ready=false" >> $GITHUB_OUTPUT
-            echo "missing=${MISSING%, }" >> $GITHUB_OUTPUT
+            echo "Issue is closed, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "ready=true" >> $GITHUB_OUTPUT
-            echo "missing=" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-  # NOT READY: Reject and remove label
-  not-ready:
-    needs: check-readiness
-    if: needs.check-readiness.outputs.ready == 'false'
-    runs-on: arc-happyvertical
-    timeout-minutes: 5
-    steps:
-      - name: Post Not Ready Comment
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          gh issue comment ${{ inputs.issue_number }} --body "## Issue Not Ready for Autopilot
-
-          The \`agent: claude\` label is for **fully autonomous implementation only**.
-
-          This issue is missing: **${{ needs.check-readiness.outputs.missing }}**
-
-          ### To use autopilot:
-          1. Ensure the issue has \`type:\`, \`priority:\`, and \`size:\` labels
-          2. Provide a detailed description (50+ characters)
-          3. Re-apply the \`agent: claude\` label
-
-          ### Alternatives:
-          - **Run Issue Checkup** workflow to have Claude triage/prepare issues
-          - **Use \`@claude\`** in a comment for interactive assistance
-          - **Manually prepare** the issue, then re-apply the label
-
-          ---
-          *Removing \`agent: claude\` label*"
-
-      - name: Remove Label
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          gh issue edit ${{ inputs.issue_number }} --remove-label "agent: claude"
-
-  # IMPLEMENT: If ready, Claude implements the issue
-  implement:
-    needs: check-readiness
-    if: needs.check-readiness.outputs.ready == 'true'
-    runs-on: arc-happyvertical
-    timeout-minutes: 60
-    steps:
       - name: Checkout repository
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
       - name: Configure Git
+        if: steps.check.outputs.skip != 'true'
         run: |
           git config user.name "claude[bot]"
           git config user.email "claude[bot]@users.noreply.github.com"
 
       - name: Setup Node.js
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
       - name: Setup pnpm
+        if: steps.check.outputs.skip != 'true'
         uses: pnpm/action-setup@v4
         with:
           version: 9
 
       - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
         run: |
           if [ -f "pnpm-lock.yaml" ]; then
             pnpm install --frozen-lockfile
@@ -185,24 +110,8 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Post Start Comment
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          gh issue comment ${{ inputs.issue_number }} --body "## Implementation Started
-
-          This issue is ready and I'm beginning implementation.
-
-          **Status**: In Progress
-          **Started**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          I'll post updates as I progress.
-
-          ---
-          *Automated implementation by Claude*"
-
       - name: Update Project Board to In Progress
-        if: inputs.project_id != '' && inputs.status_in_progress_id != ''
+        if: steps.check.outputs.skip != 'true' && inputs.project_id != '' && inputs.status_in_progress_id != ''
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
@@ -240,6 +149,7 @@ jobs:
           fi
 
       - name: Run Claude Implementation
+        if: steps.check.outputs.skip != 'true'
         id: implement
         uses: anthropics/claude-code-action@v1
         with:
@@ -263,15 +173,24 @@ jobs:
             7. **Commit**: `git commit -m "feat(scope): description\n\nCloses #${{ inputs.issue_number }}"`
             8. **Push**: `git push -u origin [branch]`
             9. **Create PR**: `gh pr create --title "..." --body "..."`
-            10. **Post completion** comment on the issue
 
-            If blocked, post a comment explaining why.
+            ## If Blocked
+
+            If you cannot complete the implementation (unclear requirements, need decisions, etc.):
+            1. Post a comment on the issue explaining what you need
+            2. Remove the `agent: claude` label so the workflow doesn't re-trigger
+            3. The human can clarify and re-apply the label when ready
+
+            ```bash
+            gh issue comment ${{ inputs.issue_number }} --body "## Need Clarification\n\n[your questions here]\n\n---\n*Removing \`agent: claude\` label until clarified*"
+            gh issue edit ${{ inputs.issue_number }} --remove-label "agent: claude"
+            ```
 
           allowed_tools: |
             Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
 
       - name: Post Failure Comment
-        if: failure()
+        if: failure() && steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
