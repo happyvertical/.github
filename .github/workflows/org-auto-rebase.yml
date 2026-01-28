@@ -1,0 +1,37 @@
+# Auto-rebase open PRs when main branch is updated
+# This prevents merge conflicts from piling up across PRs
+name: Auto Rebase PRs
+
+on:
+  # Trigger when main is updated in any repo
+  push:
+    branches: [main, master]
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Specific PR number to rebase (optional)'
+        required: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    # Don't run on the .github repo itself
+    if: github.repository != 'happyvertical/.github'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase open PRs
+        uses: peter-evans/rebase@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Only rebase PRs that are behind main
+          rebase-all: false
+          # Exclude draft PRs
+          exclude-drafts: true
+          # Exclude PRs with 'no-rebase' label
+          exclude-labels: no-rebase
