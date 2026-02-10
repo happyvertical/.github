@@ -48,7 +48,7 @@ jobs:
           echo "Scanning for issues needing attention..."
 
           # Get all open issues
-          ISSUES=$(gh issue list --state open --limit 100 --json number,title,labels,createdAt,body)
+          ISSUES=$(gh issue list --repo "${{ github.repository }}" --state open --limit 100 --json number,title,labels,createdAt,body)
 
           # Find issues missing required labels or with short descriptions
           NEEDS_ATTENTION=$(echo "$ISSUES" | jq -c '[.[] | select(
