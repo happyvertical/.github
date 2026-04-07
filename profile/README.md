@@ -1,28 +1,6 @@
 # Happy Vertical
 
-```mermaid
-graph TD
-    SDK["Layer 1: SDK<br/>Core infrastructure and utilities"]
-    SMRT["Layer 2: SMRT Framework<br/>Smart objects, collections, and code generation"]
-    Agents["Layer 3: Agents<br/>Vertical AI agents for specific domains"]
-    Products["Layer 4: Products<br/>End-user applications and knowledge bases"]
-
-    SDK --> SMRT
-    SMRT --> Agents
-    Agents --> Products
-
-    classDef sdk fill:#FF9800,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef smrt fill:#2196F3,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef agents fill:#8BC34A,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef products fill:#4CAF50,stroke:#fff,stroke-width:2px,color:#fff;
-
-    class SDK sdk;
-    class SMRT smrt;
-    class Agents agents;
-    class Products products;
-```
-
-## The SDK
+## SDK
 
 A collection of TypeScript packages providing core infrastructure for AI and data-driven applications.
 
@@ -40,7 +18,7 @@ const response = await ai.chat('Tell me a joke.');
 console.log(response);
 ```
 
-## The SMRT Framework
+## s-m-r-t Framework
 
 A TypeScript-first framework for building vertical AI agents with automatic code generation and database persistence.
 
