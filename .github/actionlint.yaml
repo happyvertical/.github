@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - arc-happyvertical
+paths:
+  .github/workflows/org-issue-triage.yml:
+    ignore:
+      - 'shellcheck reported issue in this script: SC2016:.+'

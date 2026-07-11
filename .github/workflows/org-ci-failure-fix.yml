@@ -69,8 +69,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Install dependencies
         run: |
@@ -101,7 +99,6 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          timeout_minutes: 15
           prompt: |
             REPO: ${{ github.repository }}
             WORKFLOW: ${{ inputs.workflow_name }}
@@ -124,8 +121,8 @@ jobs:
             - Do NOT force push or rewrite history
             - Commit with conventional commit format: fix: [description]
 
-          allowed_tools: |
-            Read,Write,Edit,Bash(git:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Grep,Glob,Bash(gh pr:*),Bash(gh issue:*)
+          claude_args: |
+            --allowedTools Read,Write,Edit,Bash(git:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Grep,Glob,Bash(gh pr:*),Bash(gh issue:*)
 
       - name: Post Comment on Failure
         if: failure() && inputs.pr_number != 0

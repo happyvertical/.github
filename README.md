@@ -10,7 +10,7 @@ The HappyVertical organization uses Claude Code Action for automated:
 - **@claude mentions** - AI assistance in issues and PRs
 - **CI failure auto-fix** - Automatically fix failing CI builds
 - **Test failure analysis** - Analyze and detect flaky tests
-- **Agent autopilot** - Full implementation automation via `agent: claude` label
+- **Agent autopilot** - Full implementation automation via `dispatch: claude`; active ownership remains `agent: implementation`
 
 ## Quick Start
 
@@ -36,6 +36,7 @@ In your repository settings (Settings → Secrets and variables → Actions → 
 | `PROJECT_ID` | GitHub Projects board ID | `PVT_kwDOB9Y8ns4A8-TY` |
 | `STATUS_FIELD_ID` | Status field ID | `PVTSSF_...` |
 | `STATUS_*_ID` | Status option IDs | See your project settings |
+| `AGENT_POLICY_ARTIFACT` | Signed public policy OCI digest | `ghcr.io/.../agent-policy@sha256:...` |
 
 ### 3. Ensure Org Secrets Are Available
 
@@ -104,7 +105,7 @@ Analyzes test failures:
 
 ### Agent Autopilot (`org-agent-autopilot.yml`)
 
-Full **autonomous implementation** triggered by `agent: claude` label:
+Full **autonomous implementation** triggered by `dispatch: claude`:
 1. Reads the issue and CLAUDE.md
 2. Creates feature branch
 3. Implements the solution
@@ -181,10 +182,10 @@ The `.claude/commands/` directory contains prompts for Claude:
 - `size: xl` - > 3 days
 
 ### Agent Labels
-- `agent: claude` - Triggers autopilot for full implementation
+- `dispatch: claude` - Triggers Claude implementation automation
 - `agent: triage` - AI triage in progress
 - `agent: planning` - AI planning in progress
-- `agent: implementation` - AI implementation in progress
+- `agent: implementation` - Sole exclusive implementation ownership signal
 - `agent: testing` - AI testing in progress
 - `agent: review` - AI code review in progress
 
@@ -201,7 +202,7 @@ The workflows integrate with GitHub Projects:
 | Backlog | Triage complete |
 | Planning | Manual move |
 | Ready | Definition of Ready met |
-| In Progress | `agent: claude` label or manual |
+| In Progress | active `hv-agent-claim:v1` lease or manual |
 | Review | PR created |
 | Done | PR merged or issue closed |
 

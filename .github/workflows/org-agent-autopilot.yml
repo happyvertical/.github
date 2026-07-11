@@ -15,26 +15,10 @@ on:
         description: 'Label that triggered this workflow'
         required: true
         type: string
-      project_id:
-        description: 'GitHub Projects board ID'
-        required: false
+      policy_artifact:
+        description: 'Immutable public policy artifact (OCI reference with @sha256 digest)'
+        required: true
         type: string
-        default: ''
-      status_field_id:
-        description: 'Status field ID in project'
-        required: false
-        type: string
-        default: ''
-      status_in_progress_id:
-        description: 'Status option ID for "In Progress"'
-        required: false
-        type: string
-        default: ''
-      status_review_id:
-        description: 'Status option ID for "Review"'
-        required: false
-        type: string
-        default: ''
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: 'Claude Code OAuth token'
@@ -56,7 +40,7 @@ concurrency:
 
 jobs:
   implement:
-    if: inputs.action == 'labeled' && inputs.label_name == 'agent: claude'
+    if: "${{ inputs.action == 'labeled' && inputs.label_name == 'dispatch: claude' }}"
     runs-on: arc-happyvertical
     timeout-minutes: 60
     steps:
@@ -68,9 +52,9 @@ jobs:
           STATE=$(gh issue view ${{ inputs.issue_number }} --json state --jq '.state')
           if [ "$STATE" != "OPEN" ]; then
             echo "Issue is closed, skipping"
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout repository
@@ -79,6 +63,37 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
+
+      - name: Install OCI client
+        if: steps.check.outputs.skip != 'true'
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+
+      - name: Load pinned policy runtime
+        if: steps.check.outputs.skip != 'true'
+        env:
+          POLICY_ARTIFACT: ${{ inputs.policy_artifact }}
+        run: |
+          case "$POLICY_ARTIFACT" in
+            ghcr.io/*@sha256:*) ;;
+            *) echo 'policy_artifact must be an immutable GHCR digest' >&2; exit 1 ;;
+          esac
+          mkdir -p .hv-policy
+          oras pull "$POLICY_ARTIFACT" -o .hv-policy
+          tar -xzf .hv-policy/agent-policy.tar.gz -C .hv-policy
+
+      - name: Claim implementation
+        if: steps.check.outputs.skip != 'true'
+        id: claim
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          python3 .hv-policy/scripts/hv-agent claim '${{ inputs.issue_number }}' \
+            --runtime claude \
+            --owner github-actions \
+            --session "$SESSION_ID" \
+            --branch 'agent/issue-${{ inputs.issue_number }}' \
+            --worktree "$GITHUB_WORKSPACE"
 
       - name: Configure Git
         if: steps.check.outputs.skip != 'true'
@@ -95,8 +110,6 @@ jobs:
       - name: Setup pnpm
         if: steps.check.outputs.skip != 'true'
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Install dependencies
         if: steps.check.outputs.skip != 'true'
@@ -110,51 +123,12 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Update Project Board to In Progress
-        if: steps.check.outputs.skip != 'true' && inputs.project_id != '' && inputs.status_in_progress_id != ''
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          ISSUE_NODE_ID=$(gh api graphql -f query='
-            query($owner: String!, $repo: String!, $number: Int!) {
-              repository(owner: $owner, name: $repo) {
-                issue(number: $number) {
-                  id
-                  projectItems(first: 10) {
-                    nodes {
-                      id
-                      project { id }
-                    }
-                  }
-                }
-              }
-            }
-          ' -f owner="${{ github.repository_owner }}" -f repo="${{ github.event.repository.name }}" -F number=${{ inputs.issue_number }} --jq '.data.repository.issue')
-
-          ITEM_ID=$(echo "$ISSUE_NODE_ID" | jq -r ".projectItems.nodes[] | select(.project.id == \"${{ inputs.project_id }}\") | .id" 2>/dev/null || echo "")
-
-          if [ -n "$ITEM_ID" ]; then
-            gh api graphql -f query='
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                updateProjectV2ItemFieldValue(input: {
-                  projectId: $projectId
-                  itemId: $itemId
-                  fieldId: $fieldId
-                  value: { singleSelectOptionId: $optionId }
-                }) {
-                  projectV2Item { id }
-                }
-              }
-            ' -f projectId="${{ inputs.project_id }}" -f itemId="$ITEM_ID" -f fieldId="${{ inputs.status_field_id }}" -f optionId="${{ inputs.status_in_progress_id }}" || true
-          fi
-
       - name: Run Claude Implementation
         if: steps.check.outputs.skip != 'true'
         id: implement
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          timeout_minutes: 55
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
@@ -165,29 +139,47 @@ jobs:
             ## Workflow
 
             1. **Read the issue**: `gh issue view ${{ inputs.issue_number }}`
-            2. **Read CLAUDE.md** for repository guidelines
-            3. **Create branch**: `git checkout -b feat/issue-${{ inputs.issue_number }}-[description]`
+            2. **Read AGENTS.md** and the repository manifest for repository guidelines
+            3. **Create branch**: `git checkout -b agent/issue-${{ inputs.issue_number }}-[description]`
             4. **Implement** following existing patterns
             5. **Write/update tests**
             6. **Quality checks**: `pnpm typecheck && pnpm lint && pnpm test && pnpm build`
             7. **Commit**: `git commit -m "feat(scope): description\n\nCloses #${{ inputs.issue_number }}"`
             8. **Push**: `git push -u origin [branch]`
-            9. **Create PR**: `gh pr create --title "..." --body "..."`
+            9. **Create a draft PR while implementing**, closing issue #${{ inputs.issue_number }}.
+               Include this metadata in the body with the actual validation commands:
+               `<!-- hv-agent-run:v1 -->`
+               `{"schema":"hv-agent-run:v1","runtime":"claude","session":"github-actions:${{ github.run_id }}:${{ github.run_attempt }}","issue":"${{ github.repository }}#${{ inputs.issue_number }}","policy_revision":"1.0.0","validation":["..."]}`
+
+            Do not merge. The workflow will release the claim and mark the PR ready.
 
             ## If Blocked
 
             If you cannot complete the implementation (unclear requirements, need decisions, etc.):
             1. Post a comment on the issue explaining what you need
-            2. Remove the `agent: claude` label so the workflow doesn't re-trigger
+            2. Remove the `dispatch: claude` label so the workflow doesn't re-trigger
             3. The human can clarify and re-apply the label when ready
 
             ```bash
-            gh issue comment ${{ inputs.issue_number }} --body "## Need Clarification\n\n[your questions here]\n\n---\n*Removing \`agent: claude\` label until clarified*"
-            gh issue edit ${{ inputs.issue_number }} --remove-label "agent: claude"
+            gh issue comment ${{ inputs.issue_number }} --body "## Need Clarification\n\n[your questions here]\n\n---\n*Removing \`dispatch: claude\` label until clarified*"
+            gh issue edit ${{ inputs.issue_number }} --remove-label "dispatch: claude"
             ```
 
-          allowed_tools: |
-            Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
+          claude_args: |
+            --allowedTools Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
+
+      - name: Release completed implementation
+        if: success() && steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          pr_number=$(gh pr list --state open --json number,closingIssuesReferences \
+            --jq 'map(select(any(.closingIssuesReferences[]?; .number == ${{ inputs.issue_number }}))) | first | .number // empty')
+          test -n "$pr_number" || { echo 'implementation completed without a linked PR' >&2; exit 1; }
+          python3 .hv-policy/scripts/hv-agent release '${{ inputs.issue_number }}' \
+            --session "$SESSION_ID" \
+            --message "Implementation complete in PR #$pr_number; ready for review."
 
       - name: Post Failure Comment
         if: failure() && steps.check.outputs.skip != 'true'
@@ -200,7 +192,18 @@ jobs:
 
           [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
-          The \`agent: claude\` label remains - remove it if you want to stop automated attempts.
+          The \`dispatch: claude\` label remains - remove it if you want to stop automated attempts.
 
           ---
           *Automated implementation by Claude*"
+
+      - name: Release blocked implementation
+        if: failure() && steps.claim.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          python3 .hv-policy/scripts/hv-agent release '${{ inputs.issue_number }}' \
+            --session "$SESSION_ID" \
+            --blocked \
+            --message "Hosted implementation stopped. Review the workflow log and resume from the smallest failing step."

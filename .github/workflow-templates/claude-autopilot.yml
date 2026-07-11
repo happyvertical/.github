@@ -25,18 +25,15 @@ permissions:
   id-token: write
 
 jobs:
-  # Trigger autopilot when agent: claude label is added
+  # Trigger Claude dispatch without conflating it with implementation ownership.
   autopilot:
-    if: github.event.label.name == 'agent: claude'
+    if: "${{ github.event.label.name == 'dispatch: claude' }}"
     uses: happyvertical/.github/.github/workflows/org-agent-autopilot.yml@main
     with:
       issue_number: ${{ github.event.issue.number }}
       action: ${{ github.event.action }}
       label_name: ${{ github.event.label.name }}
-      project_id: ${{ vars.PROJECT_ID || '' }}
-      status_field_id: ${{ vars.STATUS_FIELD_ID || '' }}
-      status_in_progress_id: ${{ vars.STATUS_IN_PROGRESS_ID || '' }}
-      status_review_id: ${{ vars.STATUS_REVIEW_ID || '' }}
+      policy_artifact: ${{ vars.AGENT_POLICY_ARTIFACT }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

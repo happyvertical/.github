@@ -65,8 +65,8 @@ jobs:
           COUNT=$(echo "$NEEDS_ATTENTION" | jq 'length')
 
           echo "Found $COUNT issues needing attention"
-          echo "issues=$(echo $NEEDS_ATTENTION | jq -c '.')" >> $GITHUB_OUTPUT
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          printf 'issues=%s\n' "$(printf '%s' "$NEEDS_ATTENTION" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
   checkup:
     needs: find-issues
@@ -83,11 +83,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          echo "## Issue Checkup Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Found **${{ needs.find-issues.outputs.count }}** issues needing attention." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Processing with Claude..." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Issue Checkup Report"
+            echo ""
+            echo "Found **${{ needs.find-issues.outputs.count }}** issues needing attention."
+            echo ""
+            echo "Processing with Claude..."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Ensure Claude data directory exists
         run: mkdir -p ~/.local/share/claude
@@ -165,7 +167,7 @@ jobs:
             ## Important Rules
 
             - DO NOT implement anything - this is checkup only
-            - DO NOT add `agent: claude` label
+            - DO NOT add a `dispatch:*` implementation trigger label
             - DO NOT create branches or PRs
             - Be helpful and specific in comments
             - Skip issues that already have all required labels AND adequate description
@@ -188,11 +190,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          echo "## Issue Checkup Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Processed ${{ needs.find-issues.outputs.count }} issues." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "View the checkup job logs for details." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Issue Checkup Complete"
+            echo ""
+            echo "Processed ${{ needs.find-issues.outputs.count }} issues."
+            echo ""
+            echo "View the checkup job logs for details."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   no-issues:
     needs: find-issues
@@ -202,6 +206,8 @@ jobs:
     steps:
       - name: Report Clean State
         run: |
-          echo "## Issue Checkup Complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All issues are properly triaged. No action needed." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Issue Checkup Complete"
+            echo ""
+            echo "All issues are properly triaged. No action needed."
+          } >> "$GITHUB_STEP_SUMMARY"
