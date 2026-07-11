@@ -83,7 +83,6 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          timeout_minutes: 8
           prompt: |
             REPO: ${{ github.repository }}
             REPO_DESCRIPTION: ${{ inputs.repo_description }}
@@ -92,16 +91,16 @@ jobs:
             ISSUE_TITLE: ${{ inputs.issue_title }}
             ISSUE_AUTHOR: ${{ inputs.issue_author }}
 
-            Read the triage command instructions and execute them:
-            /label-issue
-
             Additional context:
             - Issue body is available via `gh issue view ${{ inputs.issue_number }}`
             - Working directory is `repo/` which contains the calling repository
             - Check for duplicates in this repository
+            - Apply exactly one `type: *`, one `priority: *`, and one `size: *` label
+            - Explain the classification in a concise issue comment
+            - Triage only; never add a `dispatch:*` label or implement the issue
 
-          allowed_tools: |
-            Bash(gh issue:*),Bash(gh search:*),Bash(gh api:*),Read,Grep,Glob
+          claude_args: |
+            --allowedTools Bash(gh issue:*),Bash(gh search:*),Bash(gh api:*),Read,Grep,Glob
 
       - name: Add to Project Board
         if: inputs.project_id != ''
@@ -111,6 +110,7 @@ jobs:
           STATUS_FIELD_ID: ${{ inputs.status_field_id }}
           STATUS_BACKLOG_ID: ${{ inputs.status_backlog_id }}
         run: |
+          # shellcheck disable=SC2016
           cd repo
 
           # Get issue node ID

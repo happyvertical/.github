@@ -36,8 +36,6 @@ jobs:
   analyze:
     runs-on: arc-happyvertical
     timeout-minutes: 10
-    outputs:
-      analysis: ${{ steps.analyze.outputs.result }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -67,7 +65,6 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          timeout_minutes: 8
           prompt: |
             REPO: ${{ github.repository }}
             RUN_ID: ${{ inputs.run_id }}
@@ -82,14 +79,11 @@ jobs:
             - run_info.json - Run metadata
             - test-artifacts/ - Any downloaded test artifacts
 
-            Execute the analyze-tests command:
-            /analyze-tests
-
             After analysis, if PR_NUMBER is set, post a comment with your findings:
             gh pr comment $PR_NUMBER --body "[your analysis]"
 
-          allowed_tools: |
-            Read,Grep,Glob,Bash(gh pr:*),Bash(gh issue:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(tail:*)
+          claude_args: |
+            --allowedTools Read,Grep,Glob,Bash(gh pr:*),Bash(gh issue:*),Bash(jq:*),Bash(cat:*),Bash(head:*),Bash(tail:*)
 
       - name: Check for Flaky Tests
         id: flaky
@@ -107,7 +101,7 @@ jobs:
 
           if [ "$FAILURES" -gt 3 ] && [ "$TOTAL" -gt 5 ]; then
             echo "Warning: High failure rate detected - potential flaky tests"
-            echo "flaky_detected=true" >> $GITHUB_OUTPUT
+            echo "flaky_detected=true" >> "$GITHUB_OUTPUT"
           else
-            echo "flaky_detected=false" >> $GITHUB_OUTPUT
+            echo "flaky_detected=false" >> "$GITHUB_OUTPUT"
           fi
