@@ -15,10 +15,31 @@ on:
         description: 'Label that triggered this workflow'
         required: true
         type: string
+      project_id:
+        description: 'Deprecated GitHub Projects board ID; retained during caller migration'
+        required: false
+        type: string
+        default: ''
+      status_field_id:
+        description: 'Deprecated project Status field ID; retained during caller migration'
+        required: false
+        type: string
+        default: ''
+      status_in_progress_id:
+        description: 'Deprecated In Progress option ID; retained during caller migration'
+        required: false
+        type: string
+        default: ''
+      status_review_id:
+        description: 'Deprecated Review option ID; retained during caller migration'
+        required: false
+        type: string
+        default: ''
       policy_artifact:
         description: 'Immutable public policy artifact (OCI reference with @sha256 digest)'
-        required: true
+        required: false
         type: string
+        default: ''
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: 'Claude Code OAuth token'
@@ -71,15 +92,18 @@ jobs:
       - name: Load pinned policy runtime
         if: steps.check.outputs.skip != 'true'
         env:
-          POLICY_ARTIFACT: ${{ inputs.policy_artifact }}
+          POLICY_ARTIFACT: ${{ inputs.policy_artifact || vars.AGENT_POLICY_ARTIFACT }}
         run: |
           case "$POLICY_ARTIFACT" in
             ghcr.io/*@sha256:*) ;;
             *) echo 'policy_artifact must be an immutable GHCR digest' >&2; exit 1 ;;
           esac
-          mkdir -p .hv-policy
-          oras pull "$POLICY_ARTIFACT" -o .hv-policy
-          tar -xzf .hv-policy/agent-policy.tar.gz -C .hv-policy
+          policy_dir="$RUNNER_TEMP/hv-policy"
+          rm -rf "$policy_dir"
+          mkdir -p "$policy_dir"
+          oras pull "$POLICY_ARTIFACT" -o "$policy_dir"
+          tar -xzf "$policy_dir/agent-policy.tar.gz" -C "$policy_dir"
+          echo "HV_POLICY_DIR=$policy_dir" >> "$GITHUB_ENV"
 
       - name: Claim implementation
         if: steps.check.outputs.skip != 'true'
@@ -88,12 +112,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
         run: |
-          python3 .hv-policy/scripts/hv-agent claim '${{ inputs.issue_number }}' \
+          python3 "$HV_POLICY_DIR/scripts/hv-agent" claim '${{ inputs.issue_number }}' \
             --runtime claude \
             --owner github-actions \
             --session "$SESSION_ID" \
             --branch 'agent/issue-${{ inputs.issue_number }}' \
             --worktree "$GITHUB_WORKSPACE"
+
+      - name: Start implementation heartbeat
+        if: steps.claim.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          (
+            while sleep 1800; do
+              python3 "$HV_POLICY_DIR/scripts/hv-agent" heartbeat "$ISSUE_NUMBER" \
+                --session "$SESSION_ID"
+            done
+          ) >"$RUNNER_TEMP/hv-agent-heartbeat.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/hv-agent-heartbeat.pid"
 
       - name: Configure Git
         if: steps.check.outputs.skip != 'true'
@@ -168,6 +207,13 @@ jobs:
           claude_args: |
             --allowedTools Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
 
+      - name: Stop implementation heartbeat
+        if: always() && steps.claim.outcome == 'success'
+        run: |
+          if [ -f "$RUNNER_TEMP/hv-agent-heartbeat.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/hv-agent-heartbeat.pid")" 2>/dev/null || true
+          fi
+
       - name: Release completed implementation
         if: success() && steps.check.outputs.skip != 'true'
         env:
@@ -177,7 +223,7 @@ jobs:
           pr_number=$(gh pr list --state open --json number,closingIssuesReferences \
             --jq 'map(select(any(.closingIssuesReferences[]?; .number == ${{ inputs.issue_number }}))) | first | .number // empty')
           test -n "$pr_number" || { echo 'implementation completed without a linked PR' >&2; exit 1; }
-          python3 .hv-policy/scripts/hv-agent release '${{ inputs.issue_number }}' \
+          python3 "$HV_POLICY_DIR/scripts/hv-agent" release '${{ inputs.issue_number }}' \
             --session "$SESSION_ID" \
             --message "Implementation complete in PR #$pr_number; ready for review."
 
@@ -203,7 +249,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
         run: |
-          python3 .hv-policy/scripts/hv-agent release '${{ inputs.issue_number }}' \
+          python3 "$HV_POLICY_DIR/scripts/hv-agent" release '${{ inputs.issue_number }}' \
             --session "$SESSION_ID" \
             --blocked \
             --message "Hosted implementation stopped. Review the workflow log and resume from the smallest failing step."

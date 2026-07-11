@@ -111,8 +111,13 @@ jobs:
             Read the failure logs from: failure_logs.txt
             Read run info from: run_info.json
 
-            Execute the fix-ci command:
-            /fix-ci
+            Follow this CI repair procedure:
+            1. Read `failure_logs.txt` and `run_info.json`; identify the first causal failure.
+            2. Locate the smallest relevant code or workflow surface.
+            3. Make only the minimal fix for that failure.
+            4. Run the failing command locally, then the narrowest related checks.
+            5. Commit and push a conventional `fix:` commit without rewriting history.
+            If the cause is external or the safe fix is unclear, comment with the evidence and stop.
 
             Important:
             - Make minimal changes to fix the specific issue
