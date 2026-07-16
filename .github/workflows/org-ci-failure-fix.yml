@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   auto-fix:
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 20
     # Skip if branch is already a fix branch (prevent infinite loops)
     if: "!startsWith(inputs.head_branch, 'claude-auto-fix-')"
