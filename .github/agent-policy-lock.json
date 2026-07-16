@@ -1,0 +1,8 @@
+{
+  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:5d023ac9a54be9726c67a03fecde2c2e9c1e54b9d3abeb7a1b62352469424383",
+  "generation": 1,
+  "policy_revision": "1.0.0",
+  "schema": "hv-agent-policy-lock:v1",
+  "source_commit": "27428825dd045ca8d0bd2ca2518ab9ebb290f68b",
+  "source_tree_sha256": "7fe74cbc43eeba157fbef5d9064c7d76b599a0e5b1287f17b701000dd444da7c"
+}
