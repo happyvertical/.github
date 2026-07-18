@@ -254,6 +254,9 @@ All workflows use the `arc-happyvertical` self-hosted runner. Ensure your runner
 
 ## Contributing
 
+Lifecycle-protected pull requests merge through the managed merge queue so the
+synthetic merge revision is revalidated before it reaches `main`.
+
 When updating workflows:
 1. Test changes in a single repository first
 2. Update workflow templates
