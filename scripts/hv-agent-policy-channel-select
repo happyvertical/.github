@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Select one immutable lock from protected policy-channel bootstrap state."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+
+FIELDS = {
+    "schema", "revision", "default_channel", "channels", "assignments",
+    "promotion", "transition",
+}
+LOCK_FIELDS = {
+    "schema", "artifact", "generation", "policy_revision",
+    "source_commit", "source_tree_sha256",
+}
+ARTIFACT = re.compile(r"ghcr\.io/happyvertical/agent-policy@sha256:[0-9a-f]{64}")
+REPOSITORY_ID = re.compile(r"R_[A-Za-z0-9]+")
+OID = re.compile(r"[0-9a-f]{40}")
+TREE = re.compile(r"[0-9a-f]{64}")
+CHANNEL = re.compile(r"[a-z][a-z0-9-]{0,31}")
+
+
+def load_lock(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != LOCK_FIELDS:
+        raise ValueError(f"{label} lock has unexpected fields")
+    generation = value.get("generation")
+    if value.get("schema") != "hv-agent-policy-lock:v1" \
+            or not isinstance(value.get("artifact"), str) \
+            or not ARTIFACT.fullmatch(value["artifact"]) \
+            or isinstance(generation, bool) or not isinstance(generation, int) \
+            or generation < 1 \
+            or not isinstance(value.get("policy_revision"), str) \
+            or not value["policy_revision"] \
+            or not isinstance(value.get("source_commit"), str) \
+            or not OID.fullmatch(value["source_commit"]) \
+            or not isinstance(value.get("source_tree_sha256"), str) \
+            or not TREE.fullmatch(value["source_tree_sha256"]):
+        raise ValueError(f"{label} lock is invalid")
+    return value
+
+
+def select(state: object, target: str) -> tuple[str, dict[str, object]]:
+    if not isinstance(state, dict) or set(state) != FIELDS \
+            or state.get("schema") != "hv-agent-policy-channels:v1" \
+            or state.get("default_channel") != "stable" \
+            or isinstance(state.get("revision"), bool) \
+            or not isinstance(state.get("revision"), int) \
+            or state["revision"] < 1:
+        raise ValueError("source-owned policy channel state is invalid")
+    channels = state.get("channels")
+    assignments = state.get("assignments")
+    if not isinstance(channels, dict) or "stable" not in channels \
+            or not isinstance(assignments, dict):
+        raise ValueError("source-owned policy channel map is invalid")
+    for name, value in channels.items():
+        if not isinstance(name, str) or not CHANNEL.fullmatch(name):
+            raise ValueError("source-owned policy channel name is invalid")
+        load_lock(value, f"source-owned {name}")
+    for repository_id, name in assignments.items():
+        if not isinstance(repository_id, str) or not REPOSITORY_ID.fullmatch(repository_id) \
+                or name not in channels or name == "rollback":
+            raise ValueError("source-owned policy channel assignment is invalid")
+    if not REPOSITORY_ID.fullmatch(target):
+        raise ValueError("target repository ID is invalid")
+    name = assignments.get(target, "stable")
+    return name, load_lock(channels[name], f"selected {name}")
+
+
+def main() -> int:
+    if len(sys.argv) not in {4, 6, 7}:
+        print(
+            "usage: hv-agent-policy-channel-select STATE SELECTED_LOCK REPOSITORY_ID "
+            "[CANDIDATE_STATE CANDIDATE_STABLE_LOCK [TRANSITION_EVIDENCE]]",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        if len(sys.argv) >= 6:
+            if sys.argv[3] != "R_kgDOQ09NVg":
+                raise ValueError("only the trusted authority repository may select candidate state")
+            candidate = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+            candidate_lock = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
+            evidence = (
+                json.loads(Path(sys.argv[6]).read_text(encoding="utf-8"))
+                if len(sys.argv) == 7 else None
+            )
+            # Authority candidates are checked against the exact protected
+            # predecessor and, for evidence-bearing transitions, the evidence
+            # committed beside the state change.
+            import hv_agent_policy_channels as policy_channels
+
+            errors = policy_channels.transition_errors(state, candidate, evidence)
+            if errors:
+                raise ValueError("; ".join(errors))
+            selected_candidate_lock = load_lock(candidate_lock, "candidate stable projection")
+            if candidate["channels"]["stable"] != selected_candidate_lock:
+                raise ValueError("candidate stable channel differs from candidate stable projection")
+            state = candidate
+        channel, lock = select(state, sys.argv[3])
+        Path(sys.argv[2]).write_text(
+            json.dumps(lock, sort_keys=True) + "\n", encoding="utf-8",
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+    print(channel)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

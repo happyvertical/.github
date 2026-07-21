@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Manage protected agent-policy channels without per-repository generation pins."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from hv_agent_policy_channels import (
+    PolicyChannelError,
+    abort_candidate,
+    bootstrap_state,
+    channel_state_errors,
+    finalize_promotion,
+    prepare_candidate,
+    promote_candidate,
+    rollback_promotion,
+    select_lock,
+    set_channel,
+    sync_fleet_assignments,
+)
+
+
+def load(path: str) -> dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise PolicyChannelError(f"{path}: top-level value must be an object")
+    return value
+
+
+def encoded(value: Any) -> str:
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
+def write_state(path: Path, value: dict[str, Any], apply: bool) -> None:
+    if not apply:
+        print(encoded(value), end="")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False,
+        ) as handle:
+            temporary = handle.name
+            handle.write(encoded(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def changed_state(args: argparse.Namespace) -> dict[str, Any]:
+    state = load(args.state)
+    if args.command == "set-channel":
+        return set_channel(
+            state, args.name, load(args.lock), expected_revision=args.expected_revision,
+        )
+    if args.command == "sync-fleet":
+        return sync_fleet_assignments(
+            state, load(args.fleet), expected_revision=args.expected_revision,
+        )
+    if args.command == "prepare":
+        return prepare_candidate(
+            state, load(args.lock), expected_revision=args.expected_revision,
+            canary_repository_ids=args.canary_id,
+            smoke_repository_ids=args.smoke_id,
+            fleet=load(args.fleet) if args.fleet else None,
+        )
+    evidence = load(args.evidence)
+    if args.command == "promote":
+        return promote_candidate(
+            state, evidence, expected_revision=args.expected_revision,
+        )
+    if args.command == "finalize":
+        return finalize_promotion(
+            state, evidence, expected_revision=args.expected_revision,
+        )
+    if args.command == "abort":
+        return abort_candidate(
+            state, evidence, expected_revision=args.expected_revision,
+        )
+    if args.command == "rollback":
+        return rollback_promotion(
+            state, evidence, expected_revision=args.expected_revision,
+        )
+    raise PolicyChannelError(f"unsupported state transition {args.command}")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser()
+    commands = root.add_subparsers(dest="command", required=True)
+
+    validate = commands.add_parser("validate")
+    validate.add_argument("state")
+
+    bootstrap = commands.add_parser("bootstrap")
+    bootstrap.add_argument("lock")
+    bootstrap.add_argument("state")
+    bootstrap.add_argument("--apply", action="store_true")
+
+    select = commands.add_parser("select")
+    select.add_argument("state")
+    select.add_argument("--repository-id", required=True)
+
+    def transition(name: str, *, lock: bool = False, evidence: bool = False):
+        command = commands.add_parser(name)
+        command.add_argument("state")
+        if lock:
+            command.add_argument("lock")
+        if evidence:
+            command.add_argument("evidence")
+        command.add_argument("--expected-revision", type=int, required=True)
+        command.add_argument("--apply", action="store_true")
+        return command
+
+    set_named = transition("set-channel", lock=True)
+    set_named.add_argument("name")
+    sync = transition("sync-fleet")
+    sync.add_argument("fleet")
+    prepare = transition("prepare", lock=True)
+    prepare.add_argument("--fleet")
+    prepare.add_argument("--canary-id", action="append", required=True)
+    prepare.add_argument("--smoke-id", action="append", required=True)
+    transition("promote", evidence=True)
+    transition("finalize", evidence=True)
+    transition("abort", evidence=True)
+    transition("rollback", evidence=True)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "validate":
+            errors = channel_state_errors(load(args.state), args.state)
+            if errors:
+                raise PolicyChannelError("\n".join(errors))
+            print(f"policy channel state valid: {args.state}")
+            return 0
+        if args.command == "bootstrap":
+            write_state(Path(args.state), bootstrap_state(load(args.lock)), args.apply)
+            return 0
+        if args.command == "select":
+            channel, lock = select_lock(load(args.state), args.repository_id)
+            print(encoded({"channel": channel, "lock": lock}), end="")
+            return 0
+        value = changed_state(args)
+        write_state(Path(args.state), value, args.apply)
+        return 0
+    except (OSError, json.JSONDecodeError, PolicyChannelError) as exc:
+        print(f"ERROR {exc}", file=os.sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
