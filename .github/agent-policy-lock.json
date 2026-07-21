@@ -1,8 +1,8 @@
 {
-  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:298ddf4b297bc4bebdebcf4f2f0cf05e06ad0fab77903a10a36d8c1a7fe3b3fe",
-  "generation": 6,
+  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4b55f94fe74352b65ffad727f610784d638752f803eff2aa5d20af6867d8eaa0",
+  "generation": 7,
   "policy_revision": "1.0.0",
   "schema": "hv-agent-policy-lock:v1",
-  "source_commit": "ea6d05bd912b357260d5ff2e74328116702d8476",
-  "source_tree_sha256": "b7da839b21e3741e3dbe1fdab8dbca2e8e958b530c87d787ede65b09477fbdc9"
+  "source_commit": "9ece74a5156e04fd2a1b8fbde165056811258a07",
+  "source_tree_sha256": "c33879ad65db43b3f89173837f502b1a4d3f8332a0516ede4dfb7c5ea75e567b"
 }
