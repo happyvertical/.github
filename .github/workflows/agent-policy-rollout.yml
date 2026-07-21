@@ -1,0 +1,157 @@
+name: Agent Policy Rollout
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/agent-policy-channels.json]
+  repository_dispatch:
+    types: [agent-policy-rollout-ready]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: agent-policy-rollout
+  cancel-in-progress: false
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Mint ring dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.HV_AGENT_PROMOTER_APP_ID }}
+          private-key: ${{ secrets.HV_AGENT_PROMOTER_APP_PRIVATE_KEY }}
+          owner: happyvertical
+          permission-actions: write
+      - name: Mint authority transition token
+        id: promoter-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.HV_AGENT_PROMOTER_APP_ID }}
+          private-key: ${{ secrets.HV_AGENT_PROMOTER_APP_PRIVATE_KEY }}
+          owner: happyvertical
+          repositories: .github
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Select active rollout phase
+        id: phase
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ROLLOUT_READY: ${{ github.event.client_payload.rollout_ready }}
+          READY_REVISION: ${{ github.event.client_payload.state_revision }}
+        run: |
+          set -euo pipefail
+          phase=$(jq -r '.promotion.phase // "none"' .github/agent-policy-channels.json)
+          state_revision=$(jq -r '.revision' .github/agent-policy-channels.json)
+          case "$phase" in canary|smoke|none) ;; *) exit 1 ;; esac
+          if test "$phase" != none && test "$EVENT_NAME" = push; then
+            echo "policy $phase is paused for ring migration and explicit readiness confirmation"
+            phase=none
+          elif test "$phase" != none && test "$ROLLOUT_READY" != true; then
+            echo "rollout_ready=true is required for the active $phase ring" >&2
+            exit 1
+          elif test "$phase" != none \
+              && { ! [[ "$READY_REVISION" =~ ^[0-9]+$ ]] \
+                || test "$READY_REVISION" != "$state_revision"; }; then
+            echo "readiness targets revision $READY_REVISION, current state is $state_revision" >&2
+            exit 1
+          fi
+          echo "phase=$phase" >> "$GITHUB_OUTPUT"
+      - name: Run exact default-head ring
+        if: ${{ steps.phase.outputs.phase != 'none' }}
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          PHASE: ${{ steps.phase.outputs.phase }}
+        run: |
+          scripts/hv-agent-policy-canary \
+            .github/agent-policy-channels.json "$RUNNER_TEMP/evidence.json" \
+            --phase "$PHASE" --apply
+          cosign sign-blob --yes \
+            --bundle "$RUNNER_TEMP/evidence.bundle" \
+            "$RUNNER_TEMP/evidence.json"
+      - name: Apply verified transition
+        if: ${{ steps.phase.outputs.phase != 'none' }}
+        env:
+          PHASE: ${{ steps.phase.outputs.phase }}
+        run: |
+          set -euo pipefail
+          state=.github/agent-policy-channels.json
+          evidence="$RUNNER_TEMP/evidence.json"
+          revision=$(jq -r '.revision' "$state")
+          if jq -e '(.errors | length == 0) and (.results | length > 0) and all(.results[]; .conclusion == "success")' "$evidence" >/dev/null; then
+            action=$([ "$PHASE" = canary ] && echo promote || echo finalize)
+          else
+            action=$([ "$PHASE" = canary ] && echo abort || echo rollback)
+          fi
+          scripts/hv-agent-policy-channels "$action" "$state" "$evidence" \
+            --expected-revision "$revision" --apply
+          jq '.channels.stable' "$state" > .github/agent-policy-lock.json
+          next_revision=$(jq -r '.revision' "$state")
+          evidence_path=".github/agent-policy-evidence/revision-${next_revision}.json"
+          evidence_bundle_path=".github/agent-policy-evidence/revision-${next_revision}.bundle"
+          mkdir -p "$(dirname "$evidence_path")"
+          cp "$evidence" "$evidence_path"
+          cp "$RUNNER_TEMP/evidence.bundle" "$evidence_bundle_path"
+          {
+            echo "action=$action"
+            echo "revision=$next_revision"
+            echo "evidence_path=$evidence_path"
+            echo "evidence_bundle_path=$evidence_bundle_path"
+          } >> "$GITHUB_ENV"
+      - name: Open protected transition pull request
+        if: ${{ steps.phase.outputs.phase != 'none' }}
+        env:
+          GH_TOKEN: ${{ steps.promoter-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          branch="agent/policy-channel-${revision}-${action}"
+          git config user.name "hv-agent-promoter[bot]"
+          git config user.email "hv-agent-promoter[bot]@users.noreply.github.com"
+          gh auth setup-git
+          git switch -c "$branch"
+          git add .github/agent-policy-channels.json .github/agent-policy-lock.json \
+            "$evidence_path" "$evidence_bundle_path"
+          git commit -m "chore(agent-policy): ${action} channel revision ${revision}"
+          git push origin "$branch"
+          body="$RUNNER_TEMP/promotion-pr.md"
+          issue_body="$RUNNER_TEMP/promotion-issue.md"
+          {
+            echo "Protected policy-channel transition generated by the rollout workflow."
+            echo
+            echo "- Action: \`$action\`"
+            echo "- Revision: \`$revision\`"
+            echo
+            echo "Claim and release this issue through the canonical lifecycle before merging its PR."
+          } > "$issue_body"
+          issue_url=$(gh issue create --repo happyvertical/.github \
+            --title "chore(agent-policy): ${action} channel revision ${revision}" \
+            --body-file "$issue_body")
+          issue_number=${issue_url##*/}
+          {
+            echo "Automated protected policy-channel transition."
+            echo
+            echo "- Action: \`$action\`"
+            echo "- Revision: \`$revision\`"
+            echo "- Evidence SHA-256: \`$(jq -cS . "$RUNNER_TEMP/evidence.json" | shasum -a 256 | awk '{print $1}')\`"
+            echo "- Signed bundle SHA-256: \`$(shasum -a 256 "$RUNNER_TEMP/evidence.bundle" | awk '{print $1}')\`"
+            echo
+            echo "Closes #$issue_number"
+          } > "$body"
+          url=$(gh pr create --repo happyvertical/.github --base main --head "$branch" \
+            --title "chore(agent-policy): ${action} channel revision ${revision}" \
+            --body-file "$body")
+          echo "Opened $url; merge only after the canonical issue claim, review release, and required checks complete."

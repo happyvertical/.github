@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Dispatch and collect exact default-head evidence for a policy channel ring."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import hv_agent_policy_channels as channels
+
+
+WORKFLOW_PATH = ".github/workflows/agent-policy.yml"
+
+
+def command_json(arguments: list[str]) -> Any:
+    result = subprocess.run(arguments, check=False, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "command failed")
+    return json.loads(result.stdout)
+
+
+def command(arguments: list[str]) -> None:
+    result = subprocess.run(arguments, check=False, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "command failed")
+
+
+def command_text(arguments: list[str]) -> str:
+    result = subprocess.run(arguments, check=False, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "command failed")
+    return result.stdout
+
+
+def repository(repository_id: str) -> tuple[str, str, str]:
+    query = """
+      query($id: ID!) {
+        node(id: $id) {
+          ... on Repository {
+            nameWithOwner
+            defaultBranchRef { name target { oid } }
+          }
+        }
+      }
+    """
+    value = command_json([
+        "gh", "api", "graphql", "-f", f"query={query}", "-f", f"id={repository_id}",
+    ])
+    node = value.get("data", {}).get("node") if isinstance(value, dict) else None
+    branch = node.get("defaultBranchRef") if isinstance(node, dict) else None
+    target = branch.get("target") if isinstance(branch, dict) else None
+    name = node.get("nameWithOwner") if isinstance(node, dict) else None
+    branch_name = branch.get("name") if isinstance(branch, dict) else None
+    oid = target.get("oid") if isinstance(target, dict) else None
+    if not isinstance(name, str) or not name or not isinstance(branch_name, str) \
+            or not branch_name or not isinstance(oid, str) \
+            or not channels.OID.fullmatch(oid):
+        raise RuntimeError(f"cannot resolve current default head for repository {repository_id}")
+    return name, branch_name, oid
+
+
+def parse_time(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def dispatched_run(
+    name: str, branch: str, oid: str, started: dt.datetime, timeout: int, poll: int,
+    selected_channel: str, selected_artifact: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    workflow = quote(WORKFLOW_PATH, safe="")
+    selected: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        listing = command_json([
+            "gh", "api",
+            f"repos/{name}/actions/workflows/{workflow}/runs?event=workflow_dispatch"
+            f"&branch={quote(branch, safe='')}&per_page=30",
+        ])
+        runs = listing.get("workflow_runs", []) if isinstance(listing, dict) else []
+        matches = [
+            run for run in runs
+            if isinstance(run, dict)
+            and run.get("head_sha") == oid
+            and isinstance(run.get("created_at"), str)
+            and parse_time(run["created_at"]) >= started
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"{name}: ambiguous policy canary runs for {branch}@{oid}; retry with a clean lane"
+            )
+        if matches:
+            selected = matches[0]
+            break
+        time.sleep(poll)
+    if selected is None:
+        raise RuntimeError(f"{name}: policy canary dispatch did not create an exact-head run")
+
+    run_id = selected.get("id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int):
+        raise RuntimeError(f"{name}: policy canary run has no stable run ID")
+    while time.monotonic() < deadline:
+        run = command_json(["gh", "api", f"repos/{name}/actions/runs/{run_id}"])
+        run_path = str(run.get("path") or "").split("@", 1)[0]
+        if run.get("head_sha") != oid or run.get("head_branch") != branch \
+                or run_path != WORKFLOW_PATH:
+            raise RuntimeError(f"{name}: policy canary run identity changed")
+        if run.get("status") == "completed":
+            conclusion = str(run.get("conclusion") or "failure")
+            if conclusion not in channels.CONCLUSIONS:
+                conclusion = "failure"
+            verified_channel: str | None = None
+            verified_artifact: str | None = None
+            if conclusion == "success":
+                try:
+                    logs = command_text([
+                        "gh", "run", "view", str(run_id), "--repo", name, "--log",
+                    ])
+                except RuntimeError:
+                    conclusion = "failure"
+                else:
+                    identity = f"from {selected_channel} channel {selected_artifact}"
+                    if identity not in logs:
+                        conclusion = "failure"
+                    else:
+                        verified_channel = selected_channel
+                        verified_artifact = selected_artifact
+            return {
+                "repository_id": str(run.get("repository", {}).get("node_id") or ""),
+                "default_branch": branch,
+                "head_oid": oid,
+                "workflow_path": WORKFLOW_PATH,
+                "run_id": run_id,
+                "started_at": str(run.get("created_at")),
+                "conclusion": conclusion,
+                "selected_channel": verified_channel,
+                "selected_artifact": verified_artifact,
+            }
+        time.sleep(poll)
+    raise RuntimeError(f"{name}: policy canary run {run_id} did not finish before timeout")
+
+
+def collect(
+    state: dict[str, Any], phase: str, timeout: int, poll: int, apply: bool,
+) -> dict[str, Any]:
+    errors = channels.channel_state_errors(state)
+    if errors:
+        raise RuntimeError("invalid policy channel state:\n" + "\n".join(errors))
+    promotion = state.get("promotion")
+    if not isinstance(promotion, dict) or promotion.get("phase") != phase:
+        raise RuntimeError(f"policy channel state is not in {phase} phase")
+    ring_key = "canary_repository_ids" if phase == "canary" else "smoke_repository_ids"
+    repository_ids = promotion[ring_key]
+    selected_channel = "candidate" if phase == "canary" else "stable"
+    selected_artifact = promotion["candidate"]["artifact"]
+    results: list[dict[str, Any]] = []
+    collection_errors: list[dict[str, str]] = []
+    for repository_id in repository_ids:
+        try:
+            name, branch, oid = repository(repository_id)
+            if not apply:
+                print(f"would dispatch {phase} policy canary: {name} {branch}@{oid}")
+                continue
+            started = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            command([
+                "gh", "workflow", "run", WORKFLOW_PATH, "--repo", name,
+                "--ref", branch, "-f", "pr_number=0",
+            ])
+            result = dispatched_run(
+                name, branch, oid, started, timeout, poll,
+                selected_channel, selected_artifact,
+            )
+            # The GraphQL selector is canonical even if a REST run payload omits
+            # repository.node_id on older GitHub installations.
+            if result["repository_id"] not in {"", repository_id}:
+                raise RuntimeError(f"{name}: policy canary repository identity changed")
+            result["repository_id"] = repository_id
+            results.append(result)
+        except RuntimeError as exc:
+            if not apply:
+                raise
+            print(f"ERROR {repository_id}: {exc}", file=sys.stderr)
+            collection_errors.append({
+                "repository_id": repository_id,
+                "code": "collection-failed",
+            })
+    candidate = promotion["candidate"]
+    return {
+        "schema": channels.EVIDENCE_SCHEMA,
+        "phase": phase,
+        "state_revision": state["revision"],
+        "artifact": candidate["artifact"],
+        "generation": candidate["generation"],
+        "results": results,
+        "errors": collection_errors,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("state")
+    parser.add_argument("evidence")
+    parser.add_argument("--phase", choices=["canary", "smoke"], required=True)
+    parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--poll", type=int, default=10)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    if args.timeout < 30 or args.poll < 1 or args.poll > 60:
+        parser.error("timeout/poll values are outside safe bounds")
+    try:
+        state = json.loads(Path(args.state).read_text(encoding="utf-8"))
+        evidence = collect(state, args.phase, args.timeout, args.poll, args.apply)
+        if args.apply:
+            Path(args.evidence).write_text(
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            print(json.dumps(evidence, indent=2, sort_keys=True))
+        return 0
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
