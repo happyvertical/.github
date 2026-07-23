@@ -38,6 +38,18 @@ In your repository settings (Settings → Secrets and variables → Actions → 
 | `STATUS_*_ID` | Status option IDs | See your project settings |
 | `AGENT_POLICY_ARTIFACT` | Signed public policy OCI digest | `ghcr.io/.../agent-policy@sha256:...` |
 
+The organization-level `CI_LINUX_RUNNER` variable selects the general Linux CI
+pool for centrally managed reusable workflows. It defaults to
+`ci-linux-x64` when unset. Repository-owned workflows should use the same
+expression for general jobs:
+
+```yaml
+runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
+```
+
+Keep specialized selectors such as deployment, macOS, and dedicated database
+runners explicit rather than routing them through this variable.
+
 ### 3. Ensure Org Secrets Are Available
 
 The following secrets should be configured at the org level:
@@ -250,7 +262,9 @@ gh api graphql -f query='
 
 ## Runner Requirements
 
-All workflows use the `arc-happyvertical` self-hosted runner. Ensure your runner is configured and running.
+General Linux jobs use the runner selected by the organization-level
+`CI_LINUX_RUNNER` variable, with `ci-linux-x64` as the fallback. Specialized
+workflows retain their dedicated selectors.
 
 ## Contributing
 
