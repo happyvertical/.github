@@ -55,6 +55,7 @@ jobs:
             exit 1
           }
           active_state="$RUNNER_TEMP/hv-agent-policy-active-channels.json"
+          active_lock="$RUNNER_TEMP/hv-agent-policy-active-lock.json"
           active_state_error="$RUNNER_TEMP/hv-agent-policy-active-channels.error"
           protected_selector="$RUNNER_TEMP/hv-agent-policy-channel-select"
           protected_channels="$RUNNER_TEMP/hv_agent_policy_channels.py"
@@ -66,10 +67,11 @@ jobs:
               --jq '.content' | base64 --decode > "$protected_selector"
             gh api 'repos/happyvertical/.github/contents/scripts/hv_agent_policy_channels.py?ref=main' \
               --jq '.content' | base64 --decode > "$protected_channels"
+            gh api 'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
+              --jq '.content' | base64 --decode > "$active_lock"
             chmod +x "$protected_selector"
           elif grep -q 'HTTP 404' "$active_state_error"; then
             channels_active=false
-            active_lock="$RUNNER_TEMP/hv-agent-policy-active-lock.json"
             gh api 'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
               --jq '.content' | base64 --decode > "$active_lock"
             python3 - "$active_lock" "$active_state" <<'PY'
@@ -135,22 +137,25 @@ jobs:
             if test "$TARGET_REPOSITORY_NUMERIC_ID" = 1129270614 \
                 && test "$EVENT_NAME" != workflow_dispatch \
                 && test -f .github/agent-policy-channels.json \
-                && test -f .github/agent-policy-lock.json \
-                && ! cmp -s .github/agent-policy-channels.json "$active_state"; then
-              candidate=(.github/agent-policy-channels.json .github/agent-policy-lock.json)
-              transition_revision=$(jq -r '.transition.to_revision' .github/agent-policy-channels.json)
-              transition_evidence=".github/agent-policy-evidence/revision-${transition_revision}.json"
-              if test -f "$transition_evidence"; then
-                transition_bundle=".github/agent-policy-evidence/revision-${transition_revision}.bundle"
-                test -f "$transition_bundle" || {
-                  echo "transition evidence lacks its protected rollout signature bundle" >&2
-                  exit 1
-                }
-                cosign verify-blob "$transition_evidence" \
-                  --bundle "$transition_bundle" \
-                  --certificate-identity 'https://github.com/happyvertical/.github/.github/workflows/agent-policy-rollout.yml@refs/heads/main' \
-                  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
-                candidate+=("$transition_evidence")
+                && test -f .github/agent-policy-lock.json; then
+              if ! cmp -s .github/agent-policy-channels.json "$active_state"; then
+                candidate=(.github/agent-policy-channels.json .github/agent-policy-lock.json)
+                transition_revision=$(jq -r '.transition.to_revision' .github/agent-policy-channels.json)
+                transition_evidence=".github/agent-policy-evidence/revision-${transition_revision}.json"
+                if test -f "$transition_evidence"; then
+                  transition_bundle=".github/agent-policy-evidence/revision-${transition_revision}.bundle"
+                  test -f "$transition_bundle" || {
+                    echo "transition evidence lacks its protected rollout signature bundle" >&2
+                    exit 1
+                  }
+                  cosign verify-blob "$transition_evidence" \
+                    --bundle "$transition_bundle" \
+                    --certificate-identity 'https://github.com/happyvertical/.github/.github/workflows/agent-policy-rollout.yml@refs/heads/main' \
+                    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+                  candidate+=("$transition_evidence")
+                fi
+              elif ! cmp -s .github/agent-policy-lock.json "$active_lock"; then
+                candidate=(.github/agent-policy-lock.json)
               fi
             fi
             target_repository_id=$(gh api "repos/$TARGET_REPOSITORY" --jq '.node_id')
