@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   find-issues:
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 5
     outputs:
       issues: ${{ steps.scan.outputs.issues }}
@@ -71,7 +71,7 @@ jobs:
   checkup:
     needs: find-issues
     if: needs.find-issues.outputs.count != '0'
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -183,7 +183,7 @@ jobs:
   report:
     needs: [find-issues, checkup]
     if: always() && needs.find-issues.outputs.count != '0'
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 5
     steps:
       - name: Generate Report
@@ -201,7 +201,7 @@ jobs:
   no-issues:
     needs: find-issues
     if: needs.find-issues.outputs.count == '0'
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 1
     steps:
       - name: Report Clean State

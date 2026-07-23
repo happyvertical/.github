@@ -42,7 +42,7 @@ concurrency:
 
 jobs:
   handle-mention:
-    runs-on: arc-happyvertical
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
     timeout-minutes: 30
     steps:
       - name: Checkout repository
