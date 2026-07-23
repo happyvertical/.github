@@ -71,16 +71,28 @@ def select(state: object, target: str) -> tuple[str, dict[str, object]]:
 
 
 def main() -> int:
-    if len(sys.argv) not in {4, 6, 7}:
+    if len(sys.argv) not in {4, 5, 6, 7}:
         print(
             "usage: hv-agent-policy-channel-select STATE SELECTED_LOCK REPOSITORY_ID "
-            "[CANDIDATE_STATE CANDIDATE_STABLE_LOCK [TRANSITION_EVIDENCE]]",
+            "[CANDIDATE_STABLE_LOCK | "
+            "CANDIDATE_STATE CANDIDATE_STABLE_LOCK [TRANSITION_EVIDENCE]]",
             file=sys.stderr,
         )
         return 2
     try:
         state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-        if len(sys.argv) >= 6:
+        if len(sys.argv) == 5:
+            if sys.argv[3] != "R_kgDOQ09NVg":
+                raise ValueError("only the trusted authority repository may select candidate state")
+            # A lock-only authority edit cannot be a channel transition, but it
+            # must preserve the protected stable projection. Validate the
+            # active state before accessing its stable channel.
+            select(state, sys.argv[3])
+            candidate_lock = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+            selected_candidate_lock = load_lock(candidate_lock, "candidate stable projection")
+            if state["channels"]["stable"] != selected_candidate_lock:
+                raise ValueError("candidate stable channel differs from candidate stable projection")
+        elif len(sys.argv) >= 6:
             if sys.argv[3] != "R_kgDOQ09NVg":
                 raise ValueError("only the trusted authority repository may select candidate state")
             candidate = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
