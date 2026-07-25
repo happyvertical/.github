@@ -1,14 +1,6 @@
 {
   "assignments": {},
   "channels": {
-    "rollback": {
-      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4b55f94fe74352b65ffad727f610784d638752f803eff2aa5d20af6867d8eaa0",
-      "generation": 7,
-      "policy_revision": "1.0.0",
-      "schema": "hv-agent-policy-lock:v1",
-      "source_commit": "9ece74a5156e04fd2a1b8fbde165056811258a07",
-      "source_tree_sha256": "c33879ad65db43b3f89173837f502b1a4d3f8332a0516ede4dfb7c5ea75e567b"
-    },
     "stable": {
       "artifact": "ghcr.io/happyvertical/agent-policy@sha256:524965b623eb707eb7f8f8f85ce35f254b1625cf66ad1c415ef81c5efb45ed43",
       "generation": 10,
@@ -19,45 +11,15 @@
     }
   },
   "default_channel": "stable",
-  "promotion": {
-    "canary_evidence_sha256": "bb295e3c423dfea668dbb222873a042fc5caac90976d58fcd3b8ac6df7b74c64",
-    "canary_repository_ids": [
-      "R_kgDOQ09NVg",
-      "R_kgDOQDruXg"
-    ],
-    "candidate": {
-      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:524965b623eb707eb7f8f8f85ce35f254b1625cf66ad1c415ef81c5efb45ed43",
-      "generation": 10,
-      "policy_revision": "1.0.0",
-      "schema": "hv-agent-policy-lock:v1",
-      "source_commit": "36cd4ba883bb656b045a6c9501eb3abe6e25d329",
-      "source_tree_sha256": "3356231388884a9cb6424d023922b741334d31538a31f37035721682e4c18d90"
-    },
-    "phase": "smoke",
-    "previous_stable": {
-      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4b55f94fe74352b65ffad727f610784d638752f803eff2aa5d20af6867d8eaa0",
-      "generation": 7,
-      "policy_revision": "1.0.0",
-      "schema": "hv-agent-policy-lock:v1",
-      "source_commit": "9ece74a5156e04fd2a1b8fbde165056811258a07",
-      "source_tree_sha256": "c33879ad65db43b3f89173837f502b1a4d3f8332a0516ede4dfb7c5ea75e567b"
-    },
-    "smoke_repository_ids": [
-      "R_kgDOOtHtPA",
-      "R_kgDOQ09NVg",
-      "R_kgDOQDruXg",
-      "R_kgDOQmZF0A",
-      "R_kgDOQmZFRQ"
-    ]
-  },
-  "revision": 5,
+  "promotion": null,
+  "revision": 6,
   "schema": "hv-agent-policy-channels:v1",
   "transition": {
-    "action": "promote",
+    "action": "finalize",
     "artifact": "ghcr.io/happyvertical/agent-policy@sha256:524965b623eb707eb7f8f8f85ce35f254b1625cf66ad1c415ef81c5efb45ed43",
-    "evidence_sha256": "bb295e3c423dfea668dbb222873a042fc5caac90976d58fcd3b8ac6df7b74c64",
-    "from_revision": 4,
+    "evidence_sha256": "b26cccad5e8c59da69f8880dedbe990e277fad1759553b5c7ef429d3b680e2ba",
+    "from_revision": 5,
     "previous_artifact": "ghcr.io/happyvertical/agent-policy@sha256:4b55f94fe74352b65ffad727f610784d638752f803eff2aa5d20af6867d8eaa0",
-    "to_revision": 5
+    "to_revision": 6
   }
 }
