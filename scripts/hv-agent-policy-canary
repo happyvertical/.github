@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import subprocess
@@ -17,6 +18,11 @@ import hv_agent_policy_channels as channels
 
 
 WORKFLOW_PATH = ".github/workflows/agent-policy.yml"
+# A channel-aware workflow resolves its artifact through the protected channel
+# state and exports the selection under this name. Its presence in the exact
+# evidence revision is what separates a post-channel workflow from the
+# generation-6 bridge shape, which predates channels entirely.
+CHANNEL_AWARE_MARKER = "HV_POLICY_CHANNEL"
 
 
 def command_json(arguments: list[str]) -> Any:
@@ -68,6 +74,62 @@ def repository(repository_id: str) -> tuple[str, str, str]:
 
 def parse_time(value: str) -> dt.datetime:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def workflow_is_channel_aware(name: str, oid: str) -> bool:
+    """Report whether the workflow at the exact evidence revision reads a channel.
+
+    `hv-agent` derives the same distinction by byte-comparing the installed
+    workflow against the canonical generation-6 render, but this script ships as
+    authority substrate and runs where `templates/` does not exist, so it cannot
+    reproduce that comparison. Reading the workflow at the exact OID that
+    produced the evidence is template-free and equally specific about which
+    bytes it is judging.
+
+    Fail closed: an unreadable or undecodable workflow is treated as
+    channel-aware, which denies the bridge fallback rather than granting it.
+    """
+    try:
+        response = command_json([
+            "gh", "api",
+            f"repos/{name}/contents/{quote(WORKFLOW_PATH, safe='')}"
+            f"?ref={quote(oid, safe='')}",
+        ])
+    except RuntimeError:
+        return True
+    if not isinstance(response, dict) or response.get("encoding") != "base64" \
+            or not isinstance(response.get("content"), str):
+        return True
+    try:
+        content = base64.b64decode(
+            "".join(response["content"].split()), validate=True,
+        ).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return True
+    return CHANNEL_AWARE_MARKER in content
+
+
+def log_proves_channel(
+    run_logs: str,
+    selected_channel: str,
+    selected_artifact: str,
+    *,
+    bridge_workflow: bool,
+) -> bool:
+    """Decide whether a run's logs prove it loaded the channel's artifact.
+
+    Mirrors `hv-agent`'s `canary_log_proves_channel` so the rollout and the
+    migration preflight agree on what counts as proof (#286). A channel-aware
+    workflow must print the explicit selection line and gets no fallback. The
+    generation-6 bridge shape can never print it, so during migration (#238) it
+    proves the channel only by having loaded the exact artifact its channel
+    selects, evidenced by the runner's step-header echo of `POLICY_ARTIFACT` --
+    true precisely when the repository variable was repinned to that artifact,
+    false for any stale pin.
+    """
+    if f"from {selected_channel} channel {selected_artifact}" in run_logs:
+        return True
+    return bridge_workflow and f"POLICY_ARTIFACT: {selected_artifact}" in run_logs
 
 
 def dispatched_run(
@@ -125,8 +187,11 @@ def dispatched_run(
                 except RuntimeError:
                     conclusion = "failure"
                 else:
-                    identity = f"from {selected_channel} channel {selected_artifact}"
-                    if identity not in logs:
+                    bridge = not workflow_is_channel_aware(name, oid)
+                    if not log_proves_channel(
+                        logs, selected_channel, selected_artifact,
+                        bridge_workflow=bridge,
+                    ):
                         conclusion = "failure"
                     else:
                         verified_channel = selected_channel
