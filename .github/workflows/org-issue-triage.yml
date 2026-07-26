@@ -65,7 +65,7 @@ permissions:
 
 jobs:
   triage:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
+    runs-on: ${{ github.event.repository.private && format('arc-{0}', github.repository_owner) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout org .github repository

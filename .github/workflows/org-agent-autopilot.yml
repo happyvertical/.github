@@ -62,7 +62,7 @@ concurrency:
 jobs:
   implement:
     if: "${{ inputs.action == 'labeled' && inputs.label_name == 'dispatch: claude' }}"
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
+    runs-on: ${{ github.event.repository.private && format('arc-{0}', github.repository_owner) || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Check Issue State
