@@ -1,0 +1,32 @@
+{
+  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:b557217c933211de211358a7c224d4b62a7933144e92839afec1ac7b6a84f21c",
+  "errors": [],
+  "generation": 14,
+  "phase": "canary",
+  "results": [
+    {
+      "conclusion": "success",
+      "default_branch": "main",
+      "head_oid": "d76540c870ccf753f35b1389117da3829a0d8978",
+      "repository_id": "R_kgDOQ09NVg",
+      "run_id": 30234266518,
+      "selected_artifact": "ghcr.io/happyvertical/agent-policy@sha256:b557217c933211de211358a7c224d4b62a7933144e92839afec1ac7b6a84f21c",
+      "selected_channel": "candidate",
+      "started_at": "2026-07-27T03:17:33Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    },
+    {
+      "conclusion": "failure",
+      "default_branch": "main",
+      "head_oid": "a9f83df2308553811f735114e1ac73aefe365b45",
+      "repository_id": "R_kgDOQDruXg",
+      "run_id": 30234281890,
+      "selected_artifact": null,
+      "selected_channel": null,
+      "started_at": "2026-07-27T03:17:57Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    }
+  ],
+  "schema": "hv-agent-policy-channel-evidence:v1",
+  "state_revision": 10
+}
