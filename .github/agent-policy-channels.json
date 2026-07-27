@@ -1,6 +1,17 @@
 {
-  "assignments": {},
+  "assignments": {
+    "R_kgDOQ09NVg": "candidate",
+    "R_kgDOQDruXg": "candidate"
+  },
   "channels": {
+    "candidate": {
+      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:b557217c933211de211358a7c224d4b62a7933144e92839afec1ac7b6a84f21c",
+      "generation": 14,
+      "policy_revision": "1.0.0",
+      "schema": "hv-agent-policy-lock:v1",
+      "source_commit": "c855132ea6de3f4a41264d2eda726f8570b6c60d",
+      "source_tree_sha256": "253fdc0129c03e838178a721facbeb878024f769cac9bf77748d17ba18ff3179"
+    },
     "stable": {
       "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4ab44611b8664fa987356f6f39392334ada46c686aa4a6ab4b5f0f7fe9f7e0ca",
       "generation": 13,
@@ -11,15 +22,45 @@
     }
   },
   "default_channel": "stable",
-  "promotion": null,
-  "revision": 9,
+  "promotion": {
+    "canary_evidence_sha256": null,
+    "canary_repository_ids": [
+      "R_kgDOQ09NVg",
+      "R_kgDOQDruXg"
+    ],
+    "candidate": {
+      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:b557217c933211de211358a7c224d4b62a7933144e92839afec1ac7b6a84f21c",
+      "generation": 14,
+      "policy_revision": "1.0.0",
+      "schema": "hv-agent-policy-lock:v1",
+      "source_commit": "c855132ea6de3f4a41264d2eda726f8570b6c60d",
+      "source_tree_sha256": "253fdc0129c03e838178a721facbeb878024f769cac9bf77748d17ba18ff3179"
+    },
+    "phase": "canary",
+    "previous_stable": {
+      "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4ab44611b8664fa987356f6f39392334ada46c686aa4a6ab4b5f0f7fe9f7e0ca",
+      "generation": 13,
+      "policy_revision": "1.0.0",
+      "schema": "hv-agent-policy-lock:v1",
+      "source_commit": "513b83209c43f2eab29359e37aeff545621c4c72",
+      "source_tree_sha256": "cc7dde89a693f16eeb13b3a7e66e97a51a51c54e944cb92be35b45812dd4aec7"
+    },
+    "smoke_repository_ids": [
+      "R_kgDOOtHtPA",
+      "R_kgDOQ09NVg",
+      "R_kgDOQDruXg",
+      "R_kgDOQmZF0A",
+      "R_kgDOQmZFRQ"
+    ]
+  },
+  "revision": 10,
   "schema": "hv-agent-policy-channels:v1",
   "transition": {
-    "action": "finalize",
-    "artifact": "ghcr.io/happyvertical/agent-policy@sha256:4ab44611b8664fa987356f6f39392334ada46c686aa4a6ab4b5f0f7fe9f7e0ca",
-    "evidence_sha256": "69c0948ac732620379a540f731c7d53d8b17b91ebfc08c357197f063f4a4c925",
-    "from_revision": 8,
-    "previous_artifact": "ghcr.io/happyvertical/agent-policy@sha256:524965b623eb707eb7f8f8f85ce35f254b1625cf66ad1c415ef81c5efb45ed43",
-    "to_revision": 9
+    "action": "prepare",
+    "artifact": "ghcr.io/happyvertical/agent-policy@sha256:b557217c933211de211358a7c224d4b62a7933144e92839afec1ac7b6a84f21c",
+    "evidence_sha256": null,
+    "from_revision": 9,
+    "previous_artifact": "ghcr.io/happyvertical/agent-policy@sha256:4ab44611b8664fa987356f6f39392334ada46c686aa4a6ab4b5f0f7fe9f7e0ca",
+    "to_revision": 10
   }
 }
