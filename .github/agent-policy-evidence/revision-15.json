@@ -1,0 +1,65 @@
+{
+  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:78e729c396768f7e5675c676caff46706b7067a6674c2e409a475a06cf6e4dda",
+  "errors": [],
+  "generation": 16,
+  "phase": "smoke",
+  "results": [
+    {
+      "conclusion": "success",
+      "default_branch": "main",
+      "head_oid": "9ff8e4f76eb7809bf11b76de6fc8d237eb04848a",
+      "repository_id": "R_kgDOOtHtPA",
+      "run_id": 30365766333,
+      "selected_artifact": "ghcr.io/happyvertical/agent-policy@sha256:78e729c396768f7e5675c676caff46706b7067a6674c2e409a475a06cf6e4dda",
+      "selected_channel": "stable",
+      "started_at": "2026-07-28T13:55:00Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    },
+    {
+      "conclusion": "success",
+      "default_branch": "main",
+      "head_oid": "5dd8011b4fe85bdd17d16eba8d18168422ec3a43",
+      "repository_id": "R_kgDOQ09NVg",
+      "run_id": 30365819757,
+      "selected_artifact": "ghcr.io/happyvertical/agent-policy@sha256:78e729c396768f7e5675c676caff46706b7067a6674c2e409a475a06cf6e4dda",
+      "selected_channel": "stable",
+      "started_at": "2026-07-28T13:55:37Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    },
+    {
+      "conclusion": "success",
+      "default_branch": "main",
+      "head_oid": "36d48d9c6a761fedf5cd509412de1d716bb9e70c",
+      "repository_id": "R_kgDOQDruXg",
+      "run_id": 30365883635,
+      "selected_artifact": "ghcr.io/happyvertical/agent-policy@sha256:78e729c396768f7e5675c676caff46706b7067a6674c2e409a475a06cf6e4dda",
+      "selected_channel": "stable",
+      "started_at": "2026-07-28T13:56:24Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    },
+    {
+      "conclusion": "failure",
+      "default_branch": "main",
+      "head_oid": "b63189b095f3b1b840f0cd004c7e11fac8ac9152",
+      "repository_id": "R_kgDOQmZF0A",
+      "run_id": 30365919444,
+      "selected_artifact": null,
+      "selected_channel": null,
+      "started_at": "2026-07-28T13:56:51Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    },
+    {
+      "conclusion": "failure",
+      "default_branch": "main",
+      "head_oid": "89361180126ff3b3b30a42b3bd4e11fc566af1c9",
+      "repository_id": "R_kgDOQmZFRQ",
+      "run_id": 30365980413,
+      "selected_artifact": null,
+      "selected_channel": null,
+      "started_at": "2026-07-28T13:57:35Z",
+      "workflow_path": ".github/workflows/agent-policy.yml"
+    }
+  ],
+  "schema": "hv-agent-policy-channel-evidence:v1",
+  "state_revision": 14
+}
