@@ -127,11 +127,15 @@ jobs:
           if test "$channels_active" = true; then
             if test "$TARGET_REPOSITORY_NUMERIC_ID" = 1129270614 \
                 && test "$EVENT_NAME" != workflow_dispatch; then
-              test -f .github/agent-policy-channels.json \
-                && test -f .github/agent-policy-lock.json || {
+              # Explicit fail-closed form. The equivalent `test A && test B || {
+              # ...; }` reads as if-then-else but is not one, and ShellCheck
+              # rejects it as SC2015 in consumers that lint this byte-canonical
+              # workflow (happyvertical/.github#66).
+              if ! test -f .github/agent-policy-channels.json \
+                  || ! test -f .github/agent-policy-lock.json; then
                 echo 'central policy channels cannot be removed after bootstrap' >&2
                 exit 1
-              }
+              fi
             fi
             candidate=()
             if test "$TARGET_REPOSITORY_NUMERIC_ID" = 1129270614 \
