@@ -126,6 +126,21 @@ Full **autonomous implementation** triggered by `dispatch: claude`:
 
 If Claude is blocked (unclear requirements, needs decisions), it posts a comment asking for clarification and removes the label. Re-apply the label once clarified.
 
+This workflow requires `AGENT_POLICY_ARTIFACT` to be set and a `GH_TOKEN` secret
+carrying org Projects v2 scope. It exits non-zero without the former, and its
+claim/heartbeat/release steps cannot write project state with the default
+`GITHUB_TOKEN`. See `.github/workflow-templates/claude-autopilot.yml`.
+
+Because it is reachable only through `workflow_call`, `org-agent-autopilot-smoke.yml`
+invokes it against a **closed** issue so the call contract, input and secret
+binding, and runner dispatch are exercised on every pull request that touches
+either file. The closed-issue target makes the autopilot short-circuit at its
+first step, so the smoke test never starts agent work; a preflight `guard` job
+refuses to call the autopilot unless the target really is closed. It passes
+`GITHUB_TOKEN` rather than the org `GH_TOKEN`, because a local `uses:` runs the
+pull request's own copy of the reusable workflow. Run it by hand with
+`gh workflow run org-agent-autopilot-smoke.yml`.
+
 ### Issue Checkup (`org-issue-checkup.yml`)
 
 Scheduled hygiene workflow to catch issues that slipped through triage:

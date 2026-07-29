@@ -1,0 +1,105 @@
+# Autopilot Smoke Test
+#
+# `org-agent-autopilot.yml` is reachable only via `workflow_call`, so nothing in
+# this repository ever exercises it. Between 2026-01-06 and 2026-04-07 the file
+# was unparseable YAML and every push recorded an invalid-workflow-file failure
+# with zero jobs; the defect survived six months because no caller existed to
+# fail loudly. See happyvertical/.github#82.
+#
+# This job invokes the reusable workflow for real: the call contract, input and
+# secret binding, `runs-on` resolution and job dispatch all execute on a runner.
+#
+# It is deliberately short-circuiting. `issue_number` must reference a CLOSED
+# issue, so the autopilot's first step sets `skip=true` and every later step -
+# including the Claude implementation step - is skipped. This test must never
+# start agent work on a live issue, so the `guard` job below refuses to call the
+# autopilot at all unless the target is closed, rather than trusting that it
+# still is.
+name: Autopilot Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'CLOSED issue to target. An open issue would start real agent work.'
+        required: false
+        type: string
+        default: '80'
+  pull_request:
+    paths:
+      - '.github/workflows/org-agent-autopilot.yml'
+      - '.github/workflows/org-agent-autopilot-smoke.yml'
+
+# A reusable workflow cannot be granted less than it declares, so this has to
+# match the permissions block in org-agent-autopilot.yml or the call fails
+# validation. The secrets below are what keep that from mattering.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  # Fail closed. The short-circuit depends entirely on the target being closed,
+  # and issue state is mutable: reopening the target would otherwise turn the
+  # next pull request into a live autonomous implementation run against it.
+  # Deliberately not on the CI_LINUX_RUNNER pool. This is a one-command
+  # preflight, and putting it there would make a safety guard wait behind the
+  # same saturated pool as the job it is guarding, doubling the smoke test's
+  # dependency on that pool for no benefit. `invoke` stays on it, because that
+  # pool is part of what is under test.
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+    outputs:
+      issue_number: ${{ steps.target.outputs.issue_number }}
+    steps:
+      - name: Require a closed target issue
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number || '80' }}
+        run: |
+          case "$ISSUE_NUMBER" in
+            ''|*[!0-9]*)
+              echo "::error::issue_number must be a positive integer" >&2
+              exit 1
+              ;;
+          esac
+          # Strip any leading zeros; fromJSON rejects them downstream.
+          ISSUE_NUMBER=$((10#$ISSUE_NUMBER))
+          if [ "$ISSUE_NUMBER" -eq 0 ]; then
+            echo "::error::issue_number must be a positive integer" >&2
+            exit 1
+          fi
+          state=$(gh issue view "$ISSUE_NUMBER" --json state --jq '.state')
+          if [ "$state" != "CLOSED" ]; then
+            echo "::error::Refusing to smoke-test issue #$ISSUE_NUMBER: it is $state." >&2
+            echo "The smoke test forwards action=labeled and label_name='dispatch: claude'." >&2
+            echo "Against an open issue the autopilot sets skip=false and begins a real" >&2
+            echo "autonomous implementation run. Target a closed issue instead." >&2
+            exit 1
+          fi
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+  invoke:
+    needs: guard
+    uses: ./.github/workflows/org-agent-autopilot.yml
+    with:
+      issue_number: ${{ fromJSON(needs.guard.outputs.issue_number) }}
+      action: labeled
+      label_name: 'dispatch: claude'
+    # This job runs the PULL REQUEST's copy of org-agent-autopilot.yml, because a
+    # local `uses:` resolves against the caller's ref. Production credentials must
+    # not reach it: on a same-repository pull request `pull_request` still carries
+    # secrets, so an org PAT here would be exfiltratable by anyone with write
+    # access. GITHUB_TOKEN is repo-scoped, ephemeral and revoked when the job
+    # ends, and reading the target issue's state is all the short-circuit needs.
+    # The Claude credential is never reachable, since the step that consumes it is
+    # skipped, so nothing is passed.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ''
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

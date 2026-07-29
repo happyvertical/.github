@@ -70,7 +70,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          STATE=$(gh issue view ${{ inputs.issue_number }} --json state --jq '.state')
+          STATE=$(gh issue view ${{ inputs.issue_number }} --repo "${{ github.repository }}" --json state --jq '.state')
           if [ "$STATE" != "OPEN" ]; then
             echo "Issue is closed, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -232,7 +232,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          gh issue comment ${{ inputs.issue_number }} --body "## Implementation Failed
+          gh issue comment ${{ inputs.issue_number }} --repo "${{ github.repository }}" --body "## Implementation Failed
 
           I encountered an error while implementing this issue.
 
