@@ -1,0 +1,49 @@
+# Autopilot Smoke Test
+#
+# `org-agent-autopilot.yml` is reachable only via `workflow_call`, so nothing in
+# this repository ever exercises it. Between 2026-01-06 and 2026-04-07 the file
+# was unparseable YAML and every push recorded an invalid-workflow-file failure
+# with zero jobs; the defect survived six months because no caller existed to
+# fail loudly. See happyvertical/.github#82.
+#
+# This job invokes the reusable workflow for real: the call contract, input and
+# secret binding, `runs-on` resolution and job dispatch all execute on a runner.
+#
+# It is deliberately short-circuiting. `issue_number` must reference a CLOSED
+# issue, so the autopilot's first step sets `skip=true` and every later step -
+# including the Claude implementation step - is skipped. This test must never
+# start agent work on a live issue.
+name: Autopilot Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'CLOSED issue to target. An open issue would start real agent work.'
+        required: false
+        type: string
+        default: '80'
+  pull_request:
+    paths:
+      - '.github/workflows/org-agent-autopilot.yml'
+      - '.github/workflows/org-agent-autopilot-smoke.yml'
+
+# Mirrors the permissions block in .github/workflow-templates/claude-autopilot.yml
+# so the smoke test reproduces the token scope a real caller grants.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  invoke:
+    uses: ./.github/workflows/org-agent-autopilot.yml
+    with:
+      issue_number: ${{ github.event.inputs.issue_number && fromJSON(github.event.inputs.issue_number) || 80 }}
+      action: labeled
+      label_name: 'dispatch: claude'
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}

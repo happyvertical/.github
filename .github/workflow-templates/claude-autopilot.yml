@@ -3,13 +3,20 @@
 # Copy this file to your repository's .github/workflows/on-label-changed.yml
 #
 # Required org secrets:
-#   - CLAUDE_CODE_OAUTH_TOKEN
+#   - CLAUDE_CODE_OAUTH_TOKEN: Claude Code Max OAuth token.
+#   - GH_TOKEN: token carrying repo write plus org Projects v2 scope.
+#     The default GITHUB_TOKEN is not sufficient here. The autopilot's claim,
+#     heartbeat and release steps write org project items, which GITHUB_TOKEN
+#     cannot do, and a PR pushed with GITHUB_TOKEN does not trigger the
+#     downstream workflow runs the resulting PR has to pass.
 #
-# Optional repository variables:
-#   - PROJECT_ID: GitHub Projects board ID (PVT_xxx)
-#   - STATUS_FIELD_ID: Status field ID (PVTSSF_xxx)
-#   - STATUS_IN_PROGRESS_ID: Status option ID for "In Progress"
-#   - STATUS_REVIEW_ID: Status option ID for "Review"
+# Required variable (repository or org):
+#   - AGENT_POLICY_ARTIFACT: immutable policy digest, ghcr.io/...@sha256:...
+#     The reusable workflow exits non-zero when this is empty, so the autopilot
+#     cannot run without it.
+#
+# The project_id / status_*_id inputs on the reusable workflow are deprecated
+# and are intentionally not passed here.
 
 name: Label Changed
 
@@ -36,4 +43,4 @@ jobs:
       policy_artifact: ${{ vars.AGENT_POLICY_ARTIFACT }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
