@@ -44,8 +44,13 @@ jobs:
   # Fail closed. The short-circuit depends entirely on the target being closed,
   # and issue state is mutable: reopening the target would otherwise turn the
   # next pull request into a live autonomous implementation run against it.
+  # Deliberately not on the CI_LINUX_RUNNER pool. This is a one-command
+  # preflight, and putting it there would make a safety guard wait behind the
+  # same saturated pool as the job it is guarding, doubling the smoke test's
+  # dependency on that pool for no benefit. `invoke` stays on it, because that
+  # pool is part of what is under test.
   guard:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'arc-happyvertical' }}
+    runs-on: ubuntu-latest
     permissions:
       issues: read
     outputs:
