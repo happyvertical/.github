@@ -65,7 +65,7 @@ permissions:
 
 jobs:
   triage:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'arc-happyvertical' }}
     timeout-minutes: 10
     steps:
       - name: Checkout org .github repository

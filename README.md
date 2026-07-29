@@ -40,11 +40,11 @@ In your repository settings (Settings → Secrets and variables → Actions → 
 
 The organization-level `CI_LINUX_RUNNER` variable selects the general Linux CI
 pool for centrally managed reusable workflows. It defaults to
-`ci-linux-x64` when unset. Repository-owned workflows should use the same
+`arc-happyvertical` when unset. Repository-owned workflows should use the same
 expression for general jobs:
 
 ```yaml
-runs-on: ${{ vars.CI_LINUX_RUNNER || 'ci-linux-x64' }}
+runs-on: ${{ vars.CI_LINUX_RUNNER || 'arc-happyvertical' }}
 ```
 
 Keep specialized selectors such as deployment, macOS, and dedicated database
@@ -263,8 +263,11 @@ gh api graphql -f query='
 ## Runner Requirements
 
 General Linux jobs use the runner selected by the organization-level
-`CI_LINUX_RUNNER` variable, with `ci-linux-x64` as the fallback. Specialized
-workflows retain their dedicated selectors.
+`CI_LINUX_RUNNER` variable, with `arc-happyvertical` as the fallback. JIT
+runners register `[self-hosted, Linux, X64, arc-happyvertical]`, so the
+fallback names a label that is actually registered and the workflows resolve
+whether or not the variable is set. Specialized workflows retain their
+dedicated selectors.
 
 ## Contributing
 
