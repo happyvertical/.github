@@ -135,7 +135,10 @@ Because it is reachable only through `workflow_call`, `org-agent-autopilot-smoke
 invokes it against a **closed** issue so the call contract, input and secret
 binding, and runner dispatch are exercised on every pull request that touches
 either file. The closed-issue target makes the autopilot short-circuit at its
-first step, so the smoke test never starts agent work. Run it by hand with
+first step, so the smoke test never starts agent work; a preflight `guard` job
+refuses to call the autopilot unless the target really is closed. It passes
+`GITHUB_TOKEN` rather than the org `GH_TOKEN`, because a local `uses:` runs the
+pull request's own copy of the reusable workflow. Run it by hand with
 `gh workflow run org-agent-autopilot-smoke.yml`.
 
 ### Issue Checkup (`org-issue-checkup.yml`)
