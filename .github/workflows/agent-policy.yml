@@ -32,14 +32,99 @@ concurrency:
 jobs:
   lifecycle:
     name: lifecycle
-    runs-on: ubuntu-latest
+    runs-on: ${{ format('arc-{0}', github.repository_owner) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.0.6
+      # cosign-installer v4 shells out to envsubst, which is not part of the
+      # provider-neutral general runner contract. Download the publisher-
+      # compatible cosign v3 binary directly and verify its pinned SHA-256 so
+      # lifecycle enforcement has the same dependencies on every provider.
+      - name: Install signature verifier
+        env:
+          COSIGN_VERSION: v3.0.6
+          COSIGN_SHA256_AMD64: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
+          COSIGN_SHA256_ARM64: bedac92e8c3729864e13d4a17048007cfafa79d5deca993a43a90ffe018ef2b8
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) asset=cosign-linux-amd64; expected="$COSIGN_SHA256_AMD64" ;;
+            aarch64 | arm64) asset=cosign-linux-arm64; expected="$COSIGN_SHA256_ARM64" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/hv-cosign"
+          mkdir -p "$install_dir"
+          curl -fsSL -o "$install_dir/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/$asset"
+          actual=$(python3 - "$install_dir/cosign" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+          PY
+          )
+          test "$actual" = "$expected" || {
+            echo "cosign checksum mismatch: expected $expected, got $actual" >&2
+            exit 1
+          }
+          chmod +x "$install_dir/cosign"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/cosign" version
+      - name: Install GitHub CLI
+        env:
+          GH_VERSION: 2.96.0
+          GH_SHA256_AMD64: 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+          GH_SHA256_ARM64: 06f86ec7103d41993b76cd78072f43595c34aaa56506d971d9860e67140bf909
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) asset_arch=amd64; expected="$GH_SHA256_AMD64" ;;
+            aarch64 | arm64) asset_arch=arm64; expected="$GH_SHA256_ARM64" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/hv-gh"
+          archive="$install_dir/gh.tar.gz"
+          mkdir -p "$install_dir"
+          curl -fsSL -o "$archive" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${asset_arch}.tar.gz"
+          actual=$(python3 - "$archive" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+          PY
+          )
+          test "$actual" = "$expected" || {
+            echo "GitHub CLI checksum mismatch: expected $expected, got $actual" >&2
+            exit 1
+          }
+          gh_dir="$install_dir/gh_${GH_VERSION}_linux_${asset_arch}/bin"
+          python3 - "$archive" "$install_dir" "$gh_dir/gh" <<'PY'
+          import pathlib
+          import stat
+          import sys
+          import tarfile
+
+          archive = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2])
+          binary = pathlib.Path(sys.argv[3])
+          with tarfile.open(archive, "r:gz") as bundle:
+              for member in bundle.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or not (member.isfile() or member.isdir())
+                  ):
+                      raise SystemExit(f"unsafe GitHub CLI archive member: {member.name}")
+              bundle.extractall(destination)
+          binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+          PY
+          echo "$gh_dir" >> "$GITHUB_PATH"
+          "$gh_dir/gh" version
       - name: Select source-owned policy channel
         shell: bash
         env:
@@ -60,20 +145,24 @@ jobs:
           protected_selector="$RUNNER_TEMP/hv-agent-policy-channel-select"
           protected_channels="$RUNNER_TEMP/hv_agent_policy_channels.py"
           channels_active=true
-          if gh api 'repos/happyvertical/.github/contents/.github/agent-policy-channels.json?ref=main' \
-              --jq '.content' 2> "$active_state_error" \
-              | base64 --decode > "$active_state"; then
-            gh api 'repos/happyvertical/.github/contents/scripts/hv-agent-policy-channel-select?ref=main' \
-              --jq '.content' | base64 --decode > "$protected_selector"
-            gh api 'repos/happyvertical/.github/contents/scripts/hv_agent_policy_channels.py?ref=main' \
-              --jq '.content' | base64 --decode > "$protected_channels"
-            gh api 'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
-              --jq '.content' | base64 --decode > "$active_lock"
+          if gh api -H 'Accept: application/vnd.github.raw+json' \
+              'repos/happyvertical/.github/contents/.github/agent-policy-channels.json?ref=main' \
+              > "$active_state" 2> "$active_state_error"; then
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              'repos/happyvertical/.github/contents/scripts/hv-agent-policy-channel-select?ref=main' \
+              > "$protected_selector"
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              'repos/happyvertical/.github/contents/scripts/hv_agent_policy_channels.py?ref=main' \
+              > "$protected_channels"
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
+              > "$active_lock"
             chmod +x "$protected_selector"
           elif grep -q 'HTTP 404' "$active_state_error"; then
             channels_active=false
-            gh api 'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
-              --jq '.content' | base64 --decode > "$active_lock"
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              'repos/happyvertical/.github/contents/.github/agent-policy-lock.json?ref=main' \
+              > "$active_lock"
             python3 - "$active_lock" "$active_state" <<'PY'
           import json
           import re
