@@ -9,6 +9,10 @@
     "repository": "happyvertical/.github",
     "project_url": "https://github.com/orgs/happyvertical/projects/7"
   },
+  "forge": {
+    "provider": "github",
+    "repository": "happyvertical/.github"
+  },
   "labels": {
     "claim": "agent: implementation",
     "blocked": "status: blocked",
