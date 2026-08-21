@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2
       # cosign-installer v4 shells out to envsubst, which is not part of the
       # provider-neutral general runner contract. Download the publisher-
       # compatible cosign v3 binary directly and verify its pinned SHA-256 so
@@ -203,7 +203,7 @@ jobs:
                   "artifact": lock["artifact"],
                   "previous_artifact": None,
                   "evidence_sha256": None,
-              },
+                },
           }
           with open(sys.argv[2], "w", encoding="utf-8") as output:
               json.dump(state, output, indent=2, sort_keys=True)
