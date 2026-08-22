@@ -19,10 +19,12 @@ from typing import Any
 CHANNEL_SCHEMA = "hv-agent-policy-channels:v1"
 EVIDENCE_SCHEMA = "hv-agent-policy-channel-evidence:v1"
 LOCK_SCHEMA = "hv-agent-policy-lock:v1"
+ROLLOUT_METADATA_GENERATION = 27
 LOCK_FIELDS = {
     "schema", "artifact", "generation", "policy_revision",
     "source_commit", "source_tree_sha256",
 }
+ROLLOUT_LOCK_FIELDS = LOCK_FIELDS | {"rollout"}
 STATE_FIELDS = {
     "schema", "revision", "default_channel", "channels", "assignments",
     "promotion", "transition",
@@ -70,7 +72,7 @@ def policy_lock_errors(value: Any, label: str = "policy lock") -> list[str]:
     if not isinstance(value, dict):
         return [f"{label} must be an object"]
     errors: list[str] = []
-    if set(value) != LOCK_FIELDS:
+    if set(value) not in (LOCK_FIELDS, ROLLOUT_LOCK_FIELDS):
         errors.append(f"{label} has unexpected or missing fields")
     if value.get("schema") != LOCK_SCHEMA:
         errors.append(f"{label} has an unsupported schema")
@@ -80,6 +82,10 @@ def policy_lock_errors(value: Any, label: str = "policy lock") -> list[str]:
     generation = value.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         errors.append(f"{label} generation must be a positive integer")
+    elif generation >= ROLLOUT_METADATA_GENERATION and "rollout" not in value:
+        errors.append(
+            f"{label} generation {generation} must declare explicit rollout metadata"
+        )
     revision = value.get("policy_revision")
     if not isinstance(revision, str) or not revision:
         errors.append(f"{label} policy_revision must be a non-empty string")
@@ -89,7 +95,31 @@ def policy_lock_errors(value: Any, label: str = "policy lock") -> list[str]:
     tree = value.get("source_tree_sha256")
     if not isinstance(tree, str) or not TREE.fullmatch(tree):
         errors.append(f"{label} source_tree_sha256 must be a lowercase SHA-256")
+    if "rollout" in value:
+        errors.extend(rollout_metadata_errors(value["rollout"], f"{label} rollout"))
     return errors
+
+
+def rollout_metadata_errors(value: Any, label: str = "rollout") -> list[str]:
+    """Validate explicit delivery scope embedded in a generation-27+ lock."""
+    if not isinstance(value, dict) or set(value) != {
+        "kind", "consumer_migration_repository_ids",
+    }:
+        return [f"{label} must declare exactly kind and consumer_migration_repository_ids"]
+    kind = value.get("kind")
+    migrations = value.get("consumer_migration_repository_ids")
+    if kind not in {"runtime-only", "bootstrap-substrate"}:
+        return [f"{label} kind must be runtime-only or bootstrap-substrate"]
+    if not isinstance(migrations, list) or any(
+        not isinstance(repository_id, str) or not REPOSITORY_ID.fullmatch(repository_id)
+        for repository_id in migrations
+    ) or migrations != sorted(set(migrations)):
+        return [f"{label} consumer migration set must be sorted repository node IDs"]
+    if kind == "runtime-only" and migrations:
+        return [f"{label} runtime-only releases cannot declare consumer migrations"]
+    if kind == "bootstrap-substrate" and not migrations:
+        return [f"{label} bootstrap-substrate releases must declare consumer migrations"]
+    return []
 
 
 def _repository_ids(value: Any, label: str) -> tuple[list[str], list[str]]:
@@ -456,6 +486,19 @@ def prepare_candidate(
         errors.append("the protected authority repository must be in the canary ring")
     if not set(canary_ids).issubset(smoke_ids):
         errors.append("smoke_repository_ids must include the complete canary ring")
+    rollout = candidate.get("rollout")
+    if isinstance(rollout, dict) and rollout.get("kind") == "bootstrap-substrate":
+        # Runtime-only cuts deliberately do not require consumer migrations.
+        # A substrate/bootstrap cut is different: its declared consumers are
+        # the complete mandatory smoke/migration ring and each must prove the
+        # candidate before readiness can advance the channel. The canary is a
+        # smaller initial slice, so binding this to it would make later smoke
+        # members impossible to reconcile against the declared migration set.
+        migrations = rollout.get("consumer_migration_repository_ids")
+        if migrations != smoke_ids:
+            errors.append(
+                "bootstrap-substrate consumer migrations must exactly match the smoke ring"
+            )
     if errors:
         raise PolicyChannelError("invalid promotion rings:\n" + "\n".join(errors))
     state["channels"]["candidate"] = copy.deepcopy(candidate)
