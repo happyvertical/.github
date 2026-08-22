@@ -203,7 +203,7 @@ jobs:
                   "artifact": lock["artifact"],
                   "previous_artifact": None,
                   "evidence_sha256": None,
-              },
+                },
           }
           with open(sys.argv[2], "w", encoding="utf-8") as output:
               json.dump(state, output, indent=2, sort_keys=True)
