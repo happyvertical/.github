@@ -150,9 +150,21 @@ jobs:
         run: |
           set -euo pipefail
           phase=$(jq -r '.promotion.phase // "none"' .github/agent-policy-channels.json)
+          candidate_rollout_kind=$(jq -r \
+            '.promotion.candidate.rollout.kind // "none"' \
+            .github/agent-policy-channels.json)
           state_revision=$(jq -r '.revision' .github/agent-policy-channels.json)
           case "$phase" in canary|smoke|none) ;; *) exit 1 ;; esac
-          if test "$EVENT_NAME" = repository_dispatch \
+          if test "$phase" != none \
+              && test "$candidate_rollout_kind" = runtime-only; then
+            if test "$EVENT_NAME" = push; then
+              echo "runtime-only policy candidate is paused for protected canonicalize"
+              phase=none
+            else
+              echo 'a runtime-only prepared candidate accepts only the protected source promoter canonicalize transition' >&2
+              exit 1
+            fi
+          elif test "$EVENT_NAME" = repository_dispatch \
               && test "$DISPATCH_TYPE" = agent-policy-rollout-abort; then
             test "$phase" = canary || {
               echo 'an explicit policy abort requires an active canary phase' >&2

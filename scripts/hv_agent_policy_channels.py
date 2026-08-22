@@ -184,7 +184,7 @@ def channel_state_errors(value: Any, label: str = "policy channel state") -> lis
         action = transition.get("action")
         if action not in {
             "bootstrap", "set-channel", "sync-fleet", "prepare", "abort",
-            "refresh", "canonicalize", "promote", "finalize", "rollback",
+            "refresh", "canonicalize", "advance", "promote", "finalize", "rollback",
         }:
             errors.append(f"{label} transition action is invalid")
         from_revision = transition.get("from_revision")
@@ -694,6 +694,41 @@ def canonicalize_runtime_only(
     )
 
 
+def advance_runtime_only(
+    state: dict[str, Any], lock: dict[str, Any], *, expected_revision: int,
+) -> dict[str, Any]:
+    """Advance one runtime-only generation directly from clean stable state.
+
+    This is the forward-only normal path. It accepts no active promotion,
+    candidate, rollback channel, consumer migration, generation gap, or evidence
+    surrogate. Durable named compatibility channels and their assignments remain
+    unchanged while the exact signed next-generation lock becomes stable.
+    """
+    state = require_valid_state(state)
+    require_revision(state, expected_revision)
+    errors = policy_lock_errors(lock, "runtime-only advance lock")
+    if errors:
+        raise PolicyChannelError("invalid runtime-only advance lock:\n" + "\n".join(errors))
+    rollout = lock.get("rollout")
+    if not isinstance(rollout, dict) or rollout.get("kind") != "runtime-only":
+        raise PolicyChannelError("only a runtime-only lock can advance directly to stable")
+    if rollout.get("consumer_migration_repository_ids") != []:
+        raise PolicyChannelError("runtime-only advance cannot declare consumer migrations")
+    if state.get("promotion") is not None:
+        raise PolicyChannelError("runtime-only advance requires no active promotion")
+
+    stable = state["channels"]["stable"]
+    if lock["generation"] != stable["generation"] + 1:
+        raise PolicyChannelError(
+            "runtime-only advance generation must be exactly one newer than stable"
+        )
+    state["channels"]["stable"] = copy.deepcopy(lock)
+    return _transition(
+        state, "advance", artifact=lock["artifact"],
+        previous_artifact=stable["artifact"],
+    )
+
+
 def evidence_errors(
     evidence: Any, state: dict[str, Any], phase: str, expected_ids: list[str],
     *, require_success: bool, allow_all_success: bool = False,
@@ -975,6 +1010,11 @@ def transition_errors(
             )
         elif action == "canonicalize":
             expected = canonicalize_runtime_only(
+                previous, candidate["channels"]["stable"],
+                expected_revision=previous["revision"],
+            )
+        elif action == "advance":
+            expected = advance_runtime_only(
                 previous, candidate["channels"]["stable"],
                 expected_revision=previous["revision"],
             )
