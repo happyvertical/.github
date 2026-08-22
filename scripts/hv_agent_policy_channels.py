@@ -1,9 +1,9 @@
-"""Deterministic policy-channel selection, promotion, and rollback state.
+"""Deterministic policy-channel selection and staged substrate promotion.
 
 The public authority repository owns one channel document.  Consumers select a
-lock by immutable repository node ID, while promotion tooling advances the
-stable lock only after exact canary evidence and retains one rollback lock
-until post-promotion smoke evidence is complete.
+lock by immutable repository node ID. Runtime-only policy artifacts advance in
+one exact, protected canonicalization; bootstrap/substrate artifacts retain the
+staged evidence path because their installed runtime can block a forward fix.
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ def channel_state_errors(value: Any, label: str = "policy channel state") -> lis
         action = transition.get("action")
         if action not in {
             "bootstrap", "set-channel", "sync-fleet", "prepare", "abort",
-            "promote", "finalize", "rollback",
+            "refresh", "canonicalize", "promote", "finalize", "rollback",
         }:
             errors.append(f"{label} transition action is invalid")
         from_revision = transition.get("from_revision")
@@ -575,6 +575,125 @@ def prepare_candidate(
     )
 
 
+def refresh_candidate(
+    state: dict[str, Any], candidate: dict[str, Any], *, expected_revision: int,
+) -> dict[str, Any]:
+    """Replace a paused canary's signed candidate without changing its rollout.
+
+    A source-only repair must not silently widen a ring or restart a completed
+    phase.  It is therefore permitted only before any canary evidence exists,
+    for the same generation and rollout contract, and only when all three
+    source-identity fields change together.
+    """
+    state = require_valid_state(state)
+    require_revision(state, expected_revision)
+    promotion = state.get("promotion")
+    if not isinstance(promotion, dict) or promotion.get("phase") != "canary":
+        raise PolicyChannelError("policy candidate refresh is permitted only in canary phase")
+    errors = policy_lock_errors(candidate, "candidate lock")
+    if errors:
+        raise PolicyChannelError("invalid candidate lock:\n" + "\n".join(errors))
+    current = promotion["candidate"]
+    if candidate["generation"] != current["generation"]:
+        raise PolicyChannelError("policy candidate refresh must keep the same generation")
+
+    def without_source_identity(lock: dict[str, Any]) -> dict[str, Any]:
+        normalized = copy.deepcopy(lock)
+        for field in SOURCE_IDENTITY_LOCK_FIELDS:
+            normalized.pop(field, None)
+        return normalized
+
+    if without_source_identity(candidate) != without_source_identity(current):
+        raise PolicyChannelError(
+            "policy candidate refresh must preserve the rollout contract and policy revision"
+        )
+    if any(candidate[field] == current[field] for field in SOURCE_IDENTITY_LOCK_FIELDS):
+        raise PolicyChannelError(
+            "policy candidate refresh requires a new artifact and exact source identity"
+        )
+    state["channels"]["candidate"] = copy.deepcopy(candidate)
+    promotion["candidate"] = copy.deepcopy(candidate)
+    return _transition(
+        state, "refresh", artifact=candidate["artifact"],
+        previous_artifact=current["artifact"],
+    )
+
+
+def canonicalize_runtime_only(
+    state: dict[str, Any], lock: dict[str, Any], *, expected_revision: int,
+) -> dict[str, Any]:
+    """Advance a signed runtime-only lock directly to the stable channel.
+
+    A runtime-only release has no consumer migration contract, but it may only
+    replace an unproven paused runtime-only candidate for the same generation.
+    This is deliberately narrower than a generic force-promote: a fresh
+    generation, bootstrap/substrate release, smoke phase, evidenced candidate,
+    and unrelated active generation all fail closed.
+    """
+    state = require_valid_state(state)
+    require_revision(state, expected_revision)
+    errors = policy_lock_errors(lock, "canonical runtime-only lock")
+    if errors:
+        raise PolicyChannelError("invalid canonical runtime-only lock:\n" + "\n".join(errors))
+    rollout = lock.get("rollout")
+    if not isinstance(rollout, dict) or rollout.get("kind") != "runtime-only":
+        raise PolicyChannelError(
+            "only a runtime-only lock can canonicalize directly to stable"
+        )
+    if rollout.get("consumer_migration_repository_ids") != []:
+        raise PolicyChannelError(
+            "runtime-only canonicalization cannot declare consumer migrations"
+        )
+
+    stable = state["channels"]["stable"]
+    if lock["generation"] <= stable["generation"]:
+        raise PolicyChannelError(
+            "canonical runtime-only generation must be strictly newer than stable"
+        )
+    promotion = state.get("promotion")
+    if not isinstance(promotion, dict):
+        raise PolicyChannelError(
+            "direct canonicalization requires an unproven paused runtime-only candidate"
+        )
+    if promotion.get("phase") != "canary":
+        raise PolicyChannelError(
+            "direct canonicalization cannot overtake a non-canary promotion"
+        )
+    candidate = promotion.get("candidate")
+    candidate_rollout = candidate.get("rollout") if isinstance(candidate, dict) else None
+    if not isinstance(candidate_rollout, dict) \
+            or candidate_rollout.get("kind") != "runtime-only":
+        raise PolicyChannelError(
+            "direct canonicalization cannot overtake a bootstrap-substrate promotion"
+        )
+    if candidate.get("generation") != lock["generation"]:
+        raise PolicyChannelError(
+            "direct canonicalization can replace only the same generation candidate"
+        )
+    if promotion.get("canary_evidence_sha256") is not None:
+        raise PolicyChannelError(
+            "direct canonicalization cannot replace an evidenced candidate"
+        )
+
+    # Compatibility assignments are durable policy choices. Candidate
+    # assignments are temporary rollout routing and must disappear with the
+    # paused candidate so no repository can select a channel that no longer
+    # exists.
+    state["channels"]["stable"] = copy.deepcopy(lock)
+    state["channels"].pop("candidate", None)
+    state["channels"].pop("rollback", None)
+    state["assignments"] = {
+        repository_id: channel
+        for repository_id, channel in state["assignments"].items()
+        if channel != "candidate"
+    }
+    state["promotion"] = None
+    return _transition(
+        state, "canonicalize", artifact=lock["artifact"],
+        previous_artifact=stable["artifact"],
+    )
+
+
 def evidence_errors(
     evidence: Any, state: dict[str, Any], phase: str, expected_ids: list[str],
     *, require_success: bool, allow_all_success: bool = False,
@@ -845,6 +964,19 @@ def transition_errors(
                         if channel != "candidate"
                     ],
                 },
+            )
+        elif action == "refresh":
+            promotion = candidate.get("promotion")
+            if not isinstance(promotion, dict):
+                raise PolicyChannelError("refresh transition lacks promotion state")
+            expected = refresh_candidate(
+                previous, promotion["candidate"],
+                expected_revision=previous["revision"],
+            )
+        elif action == "canonicalize":
+            expected = canonicalize_runtime_only(
+                previous, candidate["channels"]["stable"],
+                expected_revision=previous["revision"],
             )
         elif action in {"promote", "finalize", "abort", "rollback"}:
             if not isinstance(evidence, dict):
