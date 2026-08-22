@@ -239,7 +239,12 @@ class GraphQLBudget:
 LIFECYCLE_GRAPHQL_BUDGETS = {
     "claim": GraphQLBudget(requests=9, points=40),
     "heartbeat": GraphQLBudget(requests=9, points=10),
-    "release": GraphQLBudget(requests=9, points=30),
+    # Release settles exact-head evidence after the claim mutation, its
+    # Project state, and the exact stale lifecycle recheck. The bounded normal
+    # path is eleven requests; keeping it at ten records the release but
+    # strands the automatic lifecycle recheck after the producer has done its
+    # durable work (#479).
+    "release": GraphQLBudget(requests=11, points=30),
     "reconcile-targeted": GraphQLBudget(requests=9, points=40),
     "check-pr": GraphQLBudget(requests=9, points=20),
     # Broad reconciliation is deliberately outside the interactive budget and
