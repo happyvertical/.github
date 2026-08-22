@@ -478,7 +478,7 @@ def prepare_candidate(
 
 def evidence_errors(
     evidence: Any, state: dict[str, Any], phase: str, expected_ids: list[str],
-    *, require_success: bool, allow_all_success: bool = False,
+    *, require_success: bool,
 ) -> list[str]:
     if not isinstance(evidence, dict):
         return ["policy channel evidence must be an object"]
@@ -580,7 +580,7 @@ def evidence_errors(
     if not require_success:
         if not seen and not failed_collection:
             errors.append("failure evidence must contain at least one expected repository")
-        if not allow_all_success and not failed_collection and results and all(
+        if not failed_collection and results and all(
             result.get("conclusion") == "success"
             for result in results if isinstance(result, dict)
         ):
@@ -646,7 +646,6 @@ def finalize_promotion(
 
 def abort_candidate(
     state: dict[str, Any], evidence: dict[str, Any], *, expected_revision: int,
-    require_cancelled_ring: bool = False,
 ) -> dict[str, Any]:
     state = require_valid_state(state)
     require_revision(state, expected_revision)
@@ -659,16 +658,6 @@ def abort_candidate(
     )
     if errors:
         raise PolicyChannelError("invalid canary failure evidence:\n" + "\n".join(errors))
-    if require_cancelled_ring:
-        results = evidence["results"]
-        failures = evidence["errors"]
-        expected_ids = promotion["canary_repository_ids"]
-        result_ids = [result["repository_id"] for result in results]
-        if failures or result_ids != expected_ids \
-                or any(result["conclusion"] != "cancelled" for result in results):
-            raise PolicyChannelError(
-                "explicit abort requires a complete exact canary ring of verified cancelled runs"
-            )
     digest = canonical_sha256(evidence)
     candidate = promotion["candidate"]
     previous = promotion["previous_stable"]
@@ -756,14 +745,9 @@ def transition_errors(
                 "abort": abort_candidate,
                 "rollback": rollback_promotion,
             }[action]
-            if action == "abort":
-                expected = abort_candidate(
-                    previous, evidence, expected_revision=previous["revision"],
-                )
-            else:
-                expected = function(
-                    previous, evidence, expected_revision=previous["revision"],
-                )
+            expected = function(
+                previous, evidence, expected_revision=previous["revision"],
+            )
         elif action == "set-channel":
             changed = [
                 name for name in set(previous["channels"]) | set(candidate["channels"])

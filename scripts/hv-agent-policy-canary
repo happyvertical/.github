@@ -134,7 +134,7 @@ def log_proves_channel(
 
 def dispatched_run(
     name: str, branch: str, oid: str, started: dt.datetime, timeout: int, poll: int,
-    selected_channel: str, selected_artifact: str, *, cancel: bool,
+    selected_channel: str, selected_artifact: str,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     workflow = quote(WORKFLOW_PATH, safe="")
@@ -167,8 +167,6 @@ def dispatched_run(
     run_id = selected.get("id")
     if isinstance(run_id, bool) or not isinstance(run_id, int):
         raise RuntimeError(f"{name}: policy canary run has no stable run ID")
-    if cancel:
-        command(["gh", "api", "--method", "POST", f"repos/{name}/actions/runs/{run_id}/cancel"])
     while time.monotonic() < deadline:
         run = command_json(["gh", "api", f"repos/{name}/actions/runs/{run_id}"])
         run_path = str(run.get("path") or "").split("@", 1)[0]
@@ -214,7 +212,7 @@ def dispatched_run(
 
 
 def collect(
-    state: dict[str, Any], phase: str, timeout: int, poll: int, apply: bool, *, cancel: bool,
+    state: dict[str, Any], phase: str, timeout: int, poll: int, apply: bool,
 ) -> dict[str, Any]:
     errors = channels.channel_state_errors(state)
     if errors:
@@ -241,7 +239,7 @@ def collect(
             ])
             result = dispatched_run(
                 name, branch, oid, started, timeout, poll,
-                selected_channel, selected_artifact, cancel=cancel,
+                selected_channel, selected_artifact,
             )
             # The GraphQL selector is canonical even if a REST run payload omits
             # repository.node_id on older GitHub installations.
@@ -274,7 +272,6 @@ def main() -> int:
     parser.add_argument("state")
     parser.add_argument("evidence")
     parser.add_argument("--phase", choices=["canary", "smoke"], required=True)
-    parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--poll", type=int, default=10)
     parser.add_argument("--apply", action="store_true")
@@ -283,9 +280,7 @@ def main() -> int:
         parser.error("timeout/poll values are outside safe bounds")
     try:
         state = json.loads(Path(args.state).read_text(encoding="utf-8"))
-        evidence = collect(
-            state, args.phase, args.timeout, args.poll, args.apply, cancel=args.cancel,
-        )
+        evidence = collect(state, args.phase, args.timeout, args.poll, args.apply)
         if args.apply:
             Path(args.evidence).write_text(
                 json.dumps(evidence, indent=2, sort_keys=True) + "\n",
