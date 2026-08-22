@@ -13,6 +13,7 @@ from typing import Any
 from hv_agent_policy_channels import (
     PolicyChannelError,
     abort_candidate,
+    advance_runtime_only,
     bootstrap_state,
     canonicalize_runtime_only,
     channel_state_errors,
@@ -84,6 +85,10 @@ def changed_state(args: argparse.Namespace) -> dict[str, Any]:
         return canonicalize_runtime_only(
             state, load(args.lock), expected_revision=args.expected_revision,
         )
+    if args.command == "advance":
+        return advance_runtime_only(
+            state, load(args.lock), expected_revision=args.expected_revision,
+        )
     evidence = load(args.evidence)
     if args.command == "promote":
         return promote_candidate(
@@ -147,6 +152,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--smoke-id", action="append", required=True)
     transition("refresh", lock=True)
     transition("canonicalize", lock=True)
+    transition("advance", lock=True)
     transition("promote", evidence=True)
     transition("finalize", evidence=True)
     abort = transition("abort", evidence=True)

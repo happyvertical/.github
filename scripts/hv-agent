@@ -2991,14 +2991,24 @@ def expected_previous_compatibility_lifecycle_workflow(
 def expected_runtime_only_predecessor_lifecycle_workflow(
     manifest: dict[str, Any],
 ) -> bytes:
-    """Return the exact generation-26 workflow accepted for a runtime-only cut."""
+    """Return the exact stage-preserving predecessor for a runtime-only cut."""
     runtime = manifest.get("runtime", {})
     runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) \
         if isinstance(runtime, dict) else ""
     if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
         raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    runtime_stage = runtime.get("agent_lifecycle_stage", "compatibility") \
+        if isinstance(runtime, dict) else ""
+    if runtime_stage not in {"compatibility", "diagnostic"}:
+        raise ValueError(
+            "runtime.agent_lifecycle_stage must be compatibility or diagnostic"
+        )
+    name = (
+        "agent-policy-compatibility.yml"
+        if runtime_stage == "compatibility" else "agent-policy.yml"
+    )
     template = (
-        artifact_root() / "templates" / "github" / "agent-policy-compatibility.yml"
+        artifact_root() / "templates" / "github" / name
     ).read_text(encoding="utf-8")
     predecessor_line = '              "rollout": manifest.get("rollout"),\n'
     if template.count(predecessor_line) != 1:
