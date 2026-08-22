@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths: [.github/agent-policy-channels.json]
   repository_dispatch:
-    types: [agent-policy-rollout-ready, agent-policy-rollout-abort]
+    types: [agent-policy-rollout-ready]
 
 permissions:
   contents: read
@@ -140,32 +140,14 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          DISPATCH_TYPE: ${{ github.event.action }}
           ROLLOUT_READY: ${{ github.event.client_payload.rollout_ready }}
-          ROLLOUT_ABORT: ${{ github.event.client_payload.rollout_abort }}
           READY_REVISION: ${{ github.event.client_payload.state_revision }}
         run: |
           set -euo pipefail
           phase=$(jq -r '.promotion.phase // "none"' .github/agent-policy-channels.json)
           state_revision=$(jq -r '.revision' .github/agent-policy-channels.json)
           case "$phase" in canary|smoke|none) ;; *) exit 1 ;; esac
-          if test "$EVENT_NAME" = repository_dispatch \
-              && test "$DISPATCH_TYPE" = agent-policy-rollout-abort; then
-            test "$phase" = canary || {
-              echo 'an explicit policy abort requires an active canary phase' >&2
-              exit 1
-            }
-            test "$ROLLOUT_ABORT" = true || {
-              echo 'rollout_abort=true is required for an explicit policy abort' >&2
-              exit 1
-            }
-            if ! [[ "$READY_REVISION" =~ ^[0-9]+$ ]] \
-                || test "$READY_REVISION" != "$state_revision"; then
-              echo "explicit abort targets revision $READY_REVISION, current state is $state_revision" >&2
-              exit 1
-            fi
-            echo "force_abort=true" >> "$GITHUB_OUTPUT"
-          elif test "$phase" != none && test "$EVENT_NAME" = push; then
+          if test "$phase" != none && test "$EVENT_NAME" = push; then
             echo "policy $phase is paused for ring migration and explicit readiness confirmation"
             phase=none
           elif test "$phase" != none && test "$ROLLOUT_READY" != true; then
@@ -183,18 +165,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           PHASE: ${{ steps.phase.outputs.phase }}
-          FORCE_ABORT: ${{ steps.phase.outputs.force_abort }}
         run: |
-          canary_command=(
-            scripts/hv-agent-policy-canary
-            .github/agent-policy-channels.json "$RUNNER_TEMP/evidence.json"
-            --phase "$PHASE"
-          )
-          if test "$FORCE_ABORT" = true; then
-            canary_command+=(--cancel)
-          fi
-          canary_command+=(--apply)
-          "${canary_command[@]}"
+          scripts/hv-agent-policy-canary \
+            .github/agent-policy-channels.json "$RUNNER_TEMP/evidence.json" \
+            --phase "$PHASE" --apply
           cosign sign-blob --yes \
             --bundle "$RUNNER_TEMP/evidence.bundle" \
             "$RUNNER_TEMP/evidence.json"
@@ -202,31 +176,18 @@ jobs:
         if: ${{ steps.phase.outputs.phase != 'none' }}
         env:
           PHASE: ${{ steps.phase.outputs.phase }}
-          FORCE_ABORT: ${{ steps.phase.outputs.force_abort }}
         run: |
           set -euo pipefail
           state=.github/agent-policy-channels.json
           evidence="$RUNNER_TEMP/evidence.json"
           revision=$(jq -r '.revision' "$state")
-          if test "$FORCE_ABORT" = true; then
-            test "$PHASE" = canary || {
-              echo 'only an active canary may be explicitly aborted' >&2
-              exit 1
-            }
-            action=abort
-          elif jq -e '(.errors | length == 0) and (.results | length > 0) and all(.results[]; .conclusion == "success")' "$evidence" >/dev/null; then
+          if jq -e '(.errors | length == 0) and (.results | length > 0) and all(.results[]; .conclusion == "success")' "$evidence" >/dev/null; then
             action=$([ "$PHASE" = canary ] && echo promote || echo finalize)
           else
             action=$([ "$PHASE" = canary ] && echo abort || echo rollback)
           fi
-          transition_command=(
-            scripts/hv-agent-policy-channels "$action" "$state" "$evidence"
-          )
-          if test "$FORCE_ABORT" = true; then
-            transition_command+=(--require-cancelled-ring)
-          fi
-          transition_command+=(--expected-revision "$revision" --apply)
-          "${transition_command[@]}"
+          scripts/hv-agent-policy-channels "$action" "$state" "$evidence" \
+            --expected-revision "$revision" --apply
           jq '.channels.stable' "$state" > .github/agent-policy-lock.json
           next_revision=$(jq -r '.revision' "$state")
           evidence_path=".github/agent-policy-evidence/revision-${next_revision}.json"
@@ -382,7 +343,7 @@ jobs:
             echo "<!-- hv-agent-run:v1 -->"
             jq -cn \
               --arg session "$session" \
-              --argjson issue "$issue_number" \
+              --arg issue "$issue_number" \
               --arg policy_revision "$runtime_policy_revision" \
               '{
                 schema: "hv-agent-run:v1",
@@ -390,7 +351,6 @@ jobs:
                 session: $session,
                 issue: $issue,
                 policy_revision: $policy_revision,
-                status: "complete",
                 validation: [
                   "protected rollout recorded a signed exact-default-head evidence bundle",
                   "canonical channel transition applied at the expected revision"
