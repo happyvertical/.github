@@ -311,6 +311,62 @@ def require_revision(state: dict[str, Any], expected_revision: int) -> None:
         )
 
 
+SOURCE_IDENTITY_LOCK_FIELDS = {
+    "artifact", "source_commit", "source_tree_sha256",
+}
+
+
+def same_prepare_except_candidate_source_identity(
+    existing: Any, recomputed: Any, *, generation: int,
+) -> bool:
+    """Allow a retry to reuse only a prepare state with refreshed source identity.
+
+    A published source-only repair can change the candidate artifact digest and
+    its two source identifiers without changing the installed authority bytes.
+    Every other channel, ring, promotion, and transition field remains part of
+    the exact protected state and must trigger a new authenticated draft head.
+    """
+    try:
+        states = [require_valid_state(value) for value in (existing, recomputed)]
+    except PolicyChannelError:
+        return False
+
+    def candidate(state: dict[str, Any]) -> dict[str, Any] | None:
+        promotion = state.get("promotion")
+        channels = state.get("channels")
+        transition = state.get("transition")
+        if not isinstance(promotion, dict) or not isinstance(channels, dict) \
+                or not isinstance(transition, dict):
+            return None
+        value = channels.get("candidate")
+        stable = channels.get("stable")
+        if not isinstance(value, dict) or not isinstance(stable, dict):
+            return None
+        if promotion.get("candidate") != value \
+                or value.get("generation") != generation \
+                or transition.get("action") != "prepare" \
+                or transition.get("artifact") != value.get("artifact") \
+                or transition.get("previous_artifact") != stable.get("artifact") \
+                or transition.get("evidence_sha256") is not None:
+            return None
+        return value
+
+    if any(candidate(state) is None for state in states):
+        return False
+
+    def normalized(state: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(state)
+        for lock in (
+            value["channels"]["candidate"], value["promotion"]["candidate"],
+        ):
+            for field in SOURCE_IDENTITY_LOCK_FIELDS:
+                lock.pop(field, None)
+        value["transition"]["artifact"] = None
+        return value
+
+    return normalized(states[0]) == normalized(states[1])
+
+
 def _transition(
     state: dict[str, Any], action: str, *, artifact: str | None,
     previous_artifact: str | None, evidence_sha256: str | None = None,
@@ -486,6 +542,19 @@ def prepare_candidate(
         errors.append("the protected authority repository must be in the canary ring")
     if not set(canary_ids).issubset(smoke_ids):
         errors.append("smoke_repository_ids must include the complete canary ring")
+    rollout = candidate.get("rollout")
+    if isinstance(rollout, dict) and rollout.get("kind") == "bootstrap-substrate":
+        # Runtime-only cuts deliberately do not require consumer migrations.
+        # A substrate/bootstrap cut is different: its declared consumers are
+        # the complete mandatory smoke/migration ring and each must prove the
+        # candidate before readiness can advance the channel. The canary is a
+        # smaller initial slice, so binding this to it would make later smoke
+        # members impossible to reconcile against the declared migration set.
+        migrations = rollout.get("consumer_migration_repository_ids")
+        if migrations != smoke_ids:
+            errors.append(
+                "bootstrap-substrate consumer migrations must exactly match the smoke ring"
+            )
     if errors:
         raise PolicyChannelError("invalid promotion rings:\n" + "\n".join(errors))
     state["channels"]["candidate"] = copy.deepcopy(candidate)
@@ -508,7 +577,7 @@ def prepare_candidate(
 
 def evidence_errors(
     evidence: Any, state: dict[str, Any], phase: str, expected_ids: list[str],
-    *, require_success: bool,
+    *, require_success: bool, allow_all_success: bool = False,
 ) -> list[str]:
     if not isinstance(evidence, dict):
         return ["policy channel evidence must be an object"]
@@ -610,7 +679,7 @@ def evidence_errors(
     if not require_success:
         if not seen and not failed_collection:
             errors.append("failure evidence must contain at least one expected repository")
-        if not failed_collection and results and all(
+        if not allow_all_success and not failed_collection and results and all(
             result.get("conclusion") == "success"
             for result in results if isinstance(result, dict)
         ):
@@ -676,6 +745,7 @@ def finalize_promotion(
 
 def abort_candidate(
     state: dict[str, Any], evidence: dict[str, Any], *, expected_revision: int,
+    require_cancelled_ring: bool = False,
 ) -> dict[str, Any]:
     state = require_valid_state(state)
     require_revision(state, expected_revision)
@@ -688,6 +758,16 @@ def abort_candidate(
     )
     if errors:
         raise PolicyChannelError("invalid canary failure evidence:\n" + "\n".join(errors))
+    if require_cancelled_ring:
+        results = evidence["results"]
+        failures = evidence["errors"]
+        expected_ids = promotion["canary_repository_ids"]
+        result_ids = [result["repository_id"] for result in results]
+        if failures or result_ids != expected_ids \
+                or any(result["conclusion"] != "cancelled" for result in results):
+            raise PolicyChannelError(
+                "explicit abort requires a complete exact canary ring of verified cancelled runs"
+            )
     digest = canonical_sha256(evidence)
     candidate = promotion["candidate"]
     previous = promotion["previous_stable"]
@@ -775,9 +855,14 @@ def transition_errors(
                 "abort": abort_candidate,
                 "rollback": rollback_promotion,
             }[action]
-            expected = function(
-                previous, evidence, expected_revision=previous["revision"],
-            )
+            if action == "abort":
+                expected = abort_candidate(
+                    previous, evidence, expected_revision=previous["revision"],
+                )
+            else:
+                expected = function(
+                    previous, evidence, expected_revision=previous["revision"],
+                )
         elif action == "set-channel":
             changed = [
                 name for name in set(previous["channels"]) | set(candidate["channels"])
