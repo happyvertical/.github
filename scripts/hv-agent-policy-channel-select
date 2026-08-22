@@ -17,15 +17,17 @@ LOCK_FIELDS = {
     "schema", "artifact", "generation", "policy_revision",
     "source_commit", "source_tree_sha256",
 }
+ROLLOUT_LOCK_FIELDS = LOCK_FIELDS | {"rollout"}
 ARTIFACT = re.compile(r"ghcr\.io/happyvertical/agent-policy@sha256:[0-9a-f]{64}")
 REPOSITORY_ID = re.compile(r"R_[A-Za-z0-9]+")
 OID = re.compile(r"[0-9a-f]{40}")
 TREE = re.compile(r"[0-9a-f]{64}")
 CHANNEL = re.compile(r"[a-z][a-z0-9-]{0,31}")
+ROLLOUT_METADATA_GENERATION = 27
 
 
 def load_lock(value: object, label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != LOCK_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (LOCK_FIELDS, ROLLOUT_LOCK_FIELDS):
         raise ValueError(f"{label} lock has unexpected fields")
     generation = value.get("generation")
     if value.get("schema") != "hv-agent-policy-lock:v1" \
@@ -40,6 +42,22 @@ def load_lock(value: object, label: str) -> dict[str, object]:
             or not isinstance(value.get("source_tree_sha256"), str) \
             or not TREE.fullmatch(value["source_tree_sha256"]):
         raise ValueError(f"{label} lock is invalid")
+    if generation >= ROLLOUT_METADATA_GENERATION and "rollout" not in value:
+        raise ValueError(f"{label} generation requires explicit rollout metadata")
+    if "rollout" in value:
+        rollout = value["rollout"]
+        if not isinstance(rollout, dict) or set(rollout) != {
+            "kind", "consumer_migration_repository_ids",
+        } or rollout.get("kind") not in {"runtime-only", "bootstrap-substrate"}:
+            raise ValueError(f"{label} rollout is invalid")
+        migrations = rollout.get("consumer_migration_repository_ids")
+        if not isinstance(migrations, list) or any(
+            not isinstance(repository_id, str) or not REPOSITORY_ID.fullmatch(repository_id)
+            for repository_id in migrations
+        ) or migrations != sorted(set(migrations)) \
+                or (rollout["kind"] == "runtime-only" and migrations) \
+                or (rollout["kind"] == "bootstrap-substrate" and not migrations):
+            raise ValueError(f"{label} rollout migration scope is invalid")
     return value
 
 
