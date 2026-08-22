@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Plan an idempotent producer-claim recovery for a generated transition."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+
+CLAIM_MARKER = "<!-- hv-agent-claim:v1 -->"
+CLAIM_PATTERN = re.compile(
+    re.escape(CLAIM_MARKER) + r"\n```json\n(?P<payload>[\s\S]*?)\n```\s*$"
+)
+
+
+def timestamp(value: Any) -> dt.datetime:
+    if not isinstance(value, str):
+        raise ValueError("claim timestamp is missing")
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("claim timestamp must include a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def flatten(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("claim comment response must be an array")
+    comments = value
+    if comments and all(isinstance(page, list) for page in comments):
+        comments = [comment for page in comments for comment in page]
+    if not all(isinstance(comment, dict) for comment in comments):
+        raise ValueError("claim comment response contains a non-object")
+    return comments
+
+
+def claim_payload(comment: dict[str, Any]) -> dict[str, Any] | None:
+    body = comment.get("body")
+    if not isinstance(body, str) or CLAIM_MARKER not in body:
+        return None
+    match = CLAIM_PATTERN.search(body)
+    if not match:
+        raise ValueError("generated transition claim marker has malformed JSON fencing")
+    payload = json.loads(match.group("payload"))
+    if not isinstance(payload, dict):
+        raise ValueError("generated transition claim payload must be an object")
+    return payload
+
+
+def replacement(payload: dict[str, Any], released_at: str) -> str:
+    expired = dict(payload)
+    expired["released_at"] = released_at
+    expired["release_reason"] = "expired"
+    return CLAIM_MARKER + "\n```json\n" + json.dumps(
+        expired, indent=2, sort_keys=True,
+    ) + "\n```\n"
+
+
+def same_transition_except_head(
+    actual: Any, expected: dict[str, Any],
+) -> bool:
+    if not isinstance(actual, dict):
+        return False
+    return all(
+        actual.get(key) == value
+        for key, value in expected.items()
+        if key != "head_sha"
+    ) and actual.get("head_sha") != expected["head_sha"]
+
+
+def identifiers(comment: dict[str, Any]) -> tuple[str, str]:
+    node_id = comment.get("node_id")
+    database_id = comment.get("id")
+    if not isinstance(node_id, str) or not node_id:
+        raise ValueError("generated transition claim lacks a GraphQL comment id")
+    if isinstance(database_id, bool) or not isinstance(database_id, int) or database_id <= 0:
+        raise ValueError("generated transition claim lacks a REST database id")
+    return node_id, str(database_id)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--comments", type=Path, required=True)
+    parser.add_argument("--owner", required=True)
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--branch", required=True)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--issue-number", type=int, required=True)
+    parser.add_argument("--pr-number", type=int, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--expired-body", type=Path, required=True)
+    args = parser.parse_args()
+
+    now = dt.datetime.now(dt.timezone.utc)
+    expected = {
+        "issue_number": args.issue_number,
+        "pr_number": args.pr_number,
+        "head_branch": args.branch,
+        "head_sha": args.head_sha,
+        "runtime": "github-actions",
+        "session": args.session,
+    }
+    matching: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    replaced_heads: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for comment in flatten(json.loads(args.comments.read_text(encoding="utf-8"))):
+        payload = claim_payload(comment)
+        if payload is None:
+            continue
+        author = comment.get("user")
+        if not isinstance(author, dict) or author.get("login") != args.owner:
+            raise ValueError("generated transition claim is not owned by the authenticated producer")
+        if (
+            payload.get("schema") != "hv-agent-claim:v1"
+            or payload.get("runtime") != "github-actions"
+            or payload.get("session") != args.session
+            or payload.get("branch") != args.branch
+        ):
+            raise ValueError("existing generated transition claim does not match its exact producer identity")
+        transition = payload.get("generated_transition")
+        if transition == expected:
+            matching.append((comment, payload))
+        elif same_transition_except_head(transition, expected):
+            replaced_heads.append((comment, payload))
+        else:
+            raise ValueError("existing generated transition claim does not match its exact producer identity")
+
+    if not matching:
+        live_replaced = [
+            pair for pair in replaced_heads if not pair[1].get("released_at")
+        ]
+        if len(live_replaced) > 1:
+            raise ValueError("generated transition has competing superseded claim comments")
+        if live_replaced:
+            comment, payload = live_replaced[0]
+            released_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            claim_comment_id, database_id = identifiers(comment)
+            args.expired_body.write_text(
+                replacement(payload, released_at), encoding="utf-8",
+            )
+            result = {
+                "mode": "supersede", "claim_comment_id": claim_comment_id,
+                "database_id": database_id,
+            }
+        else:
+            result = {"mode": "new"}
+    else:
+        review = [
+            pair for pair in matching
+            if pair[1].get("released_at") and pair[1].get("release_reason") == "review"
+        ]
+        live: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        expired: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for pair in matching:
+            payload = pair[1]
+            if payload.get("released_at"):
+                continue
+            lease_seconds = payload.get("lease_seconds")
+            if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+                raise ValueError("generated transition claim lease is invalid")
+            started = timestamp(payload.get("heartbeat_at") or payload.get("claimed_at"))
+            (live if now < started + dt.timedelta(seconds=lease_seconds) else expired).append(pair)
+        if review:
+            latest = max(review, key=lambda pair: timestamp(pair[0].get("updated_at") or pair[1].get("released_at")))
+            claim_comment_id, _database_id = identifiers(latest[0])
+            result = {"mode": "released", "claim_comment_id": claim_comment_id}
+        elif len(live) == 1 and not expired:
+            claim_comment_id, _database_id = identifiers(live[0][0])
+            result = {"mode": "active", "claim_comment_id": claim_comment_id}
+        elif len(live) > 1 or len(expired) > 1 or (live and expired):
+            raise ValueError("generated transition has competing active or expired claim comments")
+        elif expired:
+            comment, payload = expired[0]
+            released_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            args.expired_body.write_text(replacement(payload, released_at), encoding="utf-8")
+            claim_comment_id, database_id = identifiers(comment)
+            result = {
+                "mode": "reclaim", "claim_comment_id": claim_comment_id,
+                "database_id": database_id,
+            }
+        else:
+            # Reclaim is intentionally two writes: first retire the inactive
+            # selector, then create the fresh exact binding.  A retry can land
+            # between those writes.  Its retired `expired` comment is history,
+            # not an error or a reason to strand the transition; mint the same
+            # producer-owned binding again.
+            result = {"mode": "new"}
+    args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR {exc}")

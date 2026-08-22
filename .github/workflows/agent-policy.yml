@@ -32,6 +32,15 @@ concurrency:
 
 jobs:
   lifecycle:
+    # A generated transition needs GitHub to allocate its PR number before its
+    # exact-head metadata and canonical claim can be written.  Keep that short
+    # construction interval draft-only: the first evaluated lifecycle is the
+    # ready-for-review event emitted after the producer has released its claim.
+    # This is not an authorization bypass -- drafts cannot enter review or a
+    # merge queue, and every non-draft event remains fail-closed below.
+    if: >-
+      ${{ github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false }}
     name: lifecycle
     runs-on: ${{ format('arc-{0}', github.repository_owner) }}
     timeout-minutes: 10
@@ -203,7 +212,7 @@ jobs:
                   "artifact": lock["artifact"],
                   "previous_artifact": None,
                   "evidence_sha256": None,
-              },
+                },
           }
           with open(sys.argv[2], "w", encoding="utf-8") as output:
               json.dump(state, output, indent=2, sort_keys=True)
@@ -321,6 +330,7 @@ jobs:
               "policy_revision": manifest.get("policy_revision"),
               "source_commit": manifest.get("source_commit"),
               "source_tree_sha256": manifest.get("source_tree_sha256"),
+              "rollout": manifest.get("rollout"),
           }
           for field, value in expected.items():
               if lock.get(field) != value:
