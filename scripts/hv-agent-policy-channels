@@ -85,6 +85,7 @@ def changed_state(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "abort":
         return abort_candidate(
             state, evidence, expected_revision=args.expected_revision,
+            require_cancelled_ring=args.require_cancelled_ring,
         )
     if args.command == "rollback":
         return rollback_promotion(
@@ -130,7 +131,8 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--smoke-id", action="append", required=True)
     transition("promote", evidence=True)
     transition("finalize", evidence=True)
-    transition("abort", evidence=True)
+    abort = transition("abort", evidence=True)
+    abort.add_argument("--require-cancelled-ring", action="store_true")
     transition("rollback", evidence=True)
     return root
 
