@@ -1,0 +1,3756 @@
+#!/usr/bin/env python3
+"""Sanitized repository-policy and agent PR lifecycle checker."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import hv_agent_lifecycle as lifecycle
+import hv_agent_github as github
+import hv_agent_formatting_rollout as formatting_rollout
+import hv_agent_policy_channels as policy_channels
+
+
+POLICY_REVISION = "1.0.0"
+ROLLOUT_METADATA_GENERATION = 27
+CLAIM_MARKER = "<!-- hv-agent-claim:v1 -->"
+HEARTBEAT_MARKER = "<!-- hv-agent-heartbeat:v1 -->"
+RUN_MARKER = "<!-- hv-agent-run:v1 -->"
+RELEASE_MARKER = "<!-- hv-agent-release:v1"
+RECONCILE_MARKER = "<!-- hv-agent-reconcile:v1"
+BLOCKED_LABEL = "status: blocked"
+CLAIM_LABEL = "agent: implementation"
+LEASE_SECONDS = 14_400
+ROOT_GUIDANCE_MAX = 12 * 1024
+DEFAULT_AGENT_POLICY_RUNNER = "ubuntu-latest"
+AGENT_POLICY_RUNNER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+AGENT_POLICY_WORKFLOW_PATTERN = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
+AGENT_BRANCH_PATTERN = re.compile(r"(?:codex|claude|hermes|zcode|copilot|agent)/")
+LEGACY_WORKFLOW_PATH = Path(".github/workflows/agent-policy.yml")
+CONTROL_PLANE_REPOSITORY_ID = "1246847256"
+AUTHORITY_REPOSITORY_ID = "1129270614"
+AUTHORITY_REPOSITORY_NODE_ID = "R_kgDOQ09NVg"
+AUTHORITY_LOCK_PATH = Path(".github/agent-policy-lock.json")
+AUTHORITY_CHANNELS_PATH = Path(".github/agent-policy-channels.json")
+POLICY_CHANNEL_SELECTOR_PATH = Path("scripts/hv-agent-policy-channel-select")
+POLICY_CHANNEL_ROLLOUT_WORKFLOW_PATH = Path(
+    ".github/workflows/agent-policy-rollout.yml"
+)
+POLICY_CHANNEL_AUTHORITY_TOOL_PATHS = (
+    Path("scripts/hv-agent"),
+    Path("scripts/hv-agent-policy-canary"),
+    Path("scripts/hv-agent-policy-channels"),
+    Path("scripts/hv-agent-generated-transition-claim"),
+    Path("scripts/hv_agent_formatting.py"),
+    Path("scripts/hv_agent_formatting_rollout.py"),
+    Path("scripts/hv_agent_github.py"),
+    Path("scripts/hv_agent_lifecycle.py"),
+    Path("scripts/hv_agent_policy_channels.py"),
+)
+POLICY_CHANNEL_AUTHORITY_WORKFLOW_TEMPLATE = Path(
+    "templates/github/agent-policy-authority.yml"
+)
+POLICY_CHANNEL_ROLLOUT_WORKFLOW_TEMPLATE = Path(
+    "templates/github/agent-policy-rollout.yml"
+)
+AUTHORITY_SUBSTRATE_SOURCE_PATHS = (
+    POLICY_CHANNEL_AUTHORITY_WORKFLOW_TEMPLATE,
+    POLICY_CHANNEL_ROLLOUT_WORKFLOW_TEMPLATE,
+    POLICY_CHANNEL_SELECTOR_PATH,
+    *POLICY_CHANNEL_AUTHORITY_TOOL_PATHS,
+)
+AUTHORITY_SUBSTRATE_PREDECESSOR_PATH = Path("policy/authority-substrate-predecessor.json")
+
+
+def load(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: top-level value must be an object")
+    return value
+
+
+def parse_marked(body: str, marker: str, schema: str) -> dict[str, Any] | None:
+    return lifecycle.parse_marked(body, marker, schema)
+
+
+def active_claim(payload: dict[str, Any], current: dt.datetime | None = None) -> bool:
+    return lifecycle.claim_active(payload, current)
+
+
+def command_json(arguments: list[str]) -> Any:
+    result = command(arguments)
+    return json.loads(result.stdout)
+
+
+def command(arguments: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    attempts = 3 if github.retryable_gh_command(arguments) else 1
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(attempts):
+        result = subprocess.run(arguments, check=False, text=True, capture_output=True)
+        if result.returncode == 0:
+            break
+        message = result.stderr.strip() or result.stdout.strip()
+        if attempt + 1 >= attempts or not github.transient_failure(message):
+            break
+        time.sleep(0.25 * (2 ** attempt))
+    assert result is not None
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "command failed")
+    return result
+
+
+def require_no_project_repository(repo: Path, repository: str) -> None:
+    """Prove the selected checkout and canonical repository declare no manifest."""
+    if (repo / ".agents" / "project.yaml").exists():
+        raise RuntimeError(
+            "--no-project is only valid when .agents/project.yaml is absent; omit "
+            "the flag so repository lifecycle authority remains fail-closed"
+        )
+    origin = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=repo,
+        check=False, text=True, capture_output=True,
+    )
+    url = origin.stdout.strip() if origin.returncode == 0 else ""
+    match = re.search(r"github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    checkout_repository = f"{match.group(1)}/{match.group(2)}" if match else None
+    if checkout_repository != repository:
+        raise RuntimeError(
+            f"--no-project target {repository} does not match checkout origin "
+            f"{checkout_repository or 'unresolved'}; run it from the claimed repository"
+        )
+    probe = command([
+        "gh", "api", f"repos/{repository}/contents/.agents/project.yaml",
+    ], check=False)
+    if probe.returncode == 0:
+        raise RuntimeError(
+            f"{repository} default branch declares .agents/project.yaml; omit "
+            "--no-project so repository lifecycle authority remains fail-closed"
+        )
+    if "HTTP 404" not in (probe.stderr + probe.stdout):
+        raise RuntimeError(
+            f"could not prove {repository} has no project manifest: "
+            f"{probe.stderr.strip() or probe.stdout.strip() or 'manifest probe failed'}"
+        )
+
+
+GRAPHQL = github.GraphQLMeter(lambda arguments: command_json(arguments), RuntimeError)
+PROJECTS = github.ProjectV2Client(
+    lambda arguments: command_json(arguments), GRAPHQL, RuntimeError,
+)
+_LINKED_CLOSING_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_AUTHORITY_COMMENT_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def issue_state(repository: str, number: str) -> dict[str, Any]:
+    """Read issue state and canonical authority entirely through REST."""
+    return github.issue_state(
+        command_json, RuntimeError, repository, number,
+        GRAPHQL, _AUTHORITY_COMMENT_CACHE,
+    )
+
+
+def comment_once(
+    repository: str,
+    number: str,
+    marker: str,
+    message: str,
+    *,
+    pull_request: bool = False,
+) -> bool:
+    """Create one marked handoff comment, tolerating interrupted retries."""
+    pages = command_json([
+        "gh", "api", f"repos/{repository}/issues/{number}/comments?per_page=100",
+        "--paginate", "--slurp",
+    ])
+    if not isinstance(pages, list):
+        raise RuntimeError(f"issue #{number} comments returned an invalid response")
+    comments = [comment for page in pages for comment in page] \
+        if pages and isinstance(pages[0], list) else pages
+    if not all(isinstance(comment, dict) for comment in comments):
+        raise RuntimeError(f"issue #{number} comments returned an invalid page")
+    if any(marker in str(comment.get("body", "")) for comment in comments):
+        return False
+    # Pull requests share the REST issue-comment endpoint.
+    post_comment(repository, number, f"{marker}\n{message}")
+    return True
+
+
+def release_comment_marker(
+    number: str,
+    comment: dict[str, Any],
+    reason: str,
+) -> str:
+    identity = f"{number}\0{comment.get('id', '')}\0{reason}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return f"{RELEASE_MARKER} issue={number} claim={digest} -->"
+
+
+def reconcile_comment_marker(
+    number: str,
+    claims: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> str:
+    """Identify one expired-claim handoff without suppressing later cycles."""
+    expired_ids = sorted(
+        str(comment.get("id", ""))
+        for comment, payload in claims
+        if payload.get("release_reason") == "expired"
+        or not payload.get("released_at")
+    )
+    digest = hashlib.sha256("\0".join(expired_ids).encode()).hexdigest()[:16]
+    return f"{RECONCILE_MARKER} issue={number} claims={digest} -->"
+
+
+def lifecycle_issue_state(repository: str, number: str) -> dict[str, Any]:
+    return issue_state(repository, number)
+
+
+def commit_statuses(repository: str, oid: str) -> list[dict[str, Any]]:
+    pages = command_json([
+        "gh", "api", f"repos/{repository}/commits/{oid}/statuses?per_page=100",
+        "--paginate", "--slurp",
+    ])
+    if not isinstance(pages, list):
+        raise RuntimeError(f"commit {oid} statuses returned an invalid response")
+    statuses = [status for page in pages for status in page] \
+        if pages and isinstance(pages[0], list) else pages
+    if not all(isinstance(status, dict) for status in statuses):
+        raise RuntimeError(f"commit {oid} statuses returned an invalid page")
+    return statuses
+
+
+def ensure_release_status_evidence(
+    repository: str,
+    issue: dict[str, Any],
+    comment: dict[str, Any],
+    payload: dict[str, Any],
+    linked: list[dict[str, Any]],
+    *,
+    create: bool,
+) -> tuple[str, str] | None:
+    """Create and verify immutable owner-attributed evidence on every PR head."""
+    if payload.get("release_reason") not in lifecycle.PR_BOUND_RELEASE_REASONS:
+        return None
+    if not issue.get("authorityMetadataComplete"):
+        return None
+    if not linked:
+        raise RuntimeError(
+            "released claim has no exact PR snapshots for immutable evidence verification"
+        )
+    pair = (comment, payload)
+    if not lifecycle.claim_pair_current(pair):
+        raise RuntimeError(
+            "selected claim belongs to an earlier issue incarnation; reacquire and "
+            "release a new cycle"
+        )
+    evidence = lifecycle.release_evidence_payload(issue, pair)
+    context = lifecycle.release_evidence_context(evidence)
+    digest = context.rsplit("/", 1)[-1]
+    payload["release_evidence_sha256"] = digest
+    target_url = str(comment.get("html_url") or comment.get("htmlUrl") or "")
+    if not target_url:
+        raise RuntimeError("selected claim lacks a canonical GitHub comment URL")
+    evidence_times: list[dt.datetime] = []
+    for pr in sorted(linked, key=lambda item: int(item.get("number") or 0)):
+        oid = str(pr.get("headRefOid") or "")
+        if not oid:
+            raise RuntimeError(
+                f"linked PR #{pr.get('number')} lacks an exact head revision"
+            )
+        state = {**pr, "commitStatuses": commit_statuses(repository, oid)}
+        existing_error = lifecycle.release_status_evidence_error(issue, pair, state)
+        if existing_error is not None:
+            if not create:
+                raise RuntimeError(
+                    f"released claim lacks immutable release evidence for PR "
+                    f"#{pr.get('number')}: {existing_error}; reacquire and release a new cycle"
+                )
+            require_claim_actor(payload, "authorize its immutable release status")
+            description = (
+                f"hv-agent {payload.get('release_reason')} by {payload.get('owner')}"
+            )[:140]
+            command_json([
+                "gh", "api", "--method", "POST",
+                f"repos/{repository}/statuses/{oid}",
+                "-f", "state=success",
+                "-f", f"context={context}",
+                "-f", f"description={description}",
+                "-f", f"target_url={target_url}",
+            ])
+            state["commitStatuses"] = commit_statuses(repository, oid)
+            error = lifecycle.release_status_evidence_error(issue, pair, state)
+            if error:
+                raise RuntimeError(
+                    f"immutable release status did not settle for PR #{pr.get('number')}: "
+                    f"{error}; retry this exact release cycle"
+                )
+        generation = issue.get("claimGeneration") or {}
+        generated_at = lifecycle.parse_timestamp(generation.get("createdAt"))
+        owner_node_id = str(comment.get("authorNodeId") or "")
+        matching_times = [
+            lifecycle.parse_timestamp(status.get("createdAt") or status.get("created_at"))
+            for status in state["commitStatuses"]
+            if status.get("context") == context
+            and status.get("state") == "success"
+            and (status.get("creator") or {}).get("node_id") == owner_node_id
+            and status.get("target_url") == target_url
+            and status.get("sha") in {None, oid}
+        ]
+        per_head_times = [
+            value for value in matching_times
+            if value is not None and generated_at is not None and value > generated_at
+        ]
+        if not per_head_times:
+            raise RuntimeError(
+                f"immutable release evidence timestamp is missing for PR #{pr.get('number')}"
+            )
+        evidence_times.append(min(per_head_times))
+    return digest, max(evidence_times).isoformat().replace("+00:00", "Z")
+
+
+def linked_closing_prs(
+    repository: str,
+    issue_number: str,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    key = (repository, str(issue_number))
+    if not refresh and key in _LINKED_CLOSING_CACHE:
+        return _LINKED_CLOSING_CACHE[key]
+    owner, name = repository.split("/", 1)
+    pages: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _page in range(20):
+        strings = {"owner": owner, "name": name}
+        if cursor is not None:
+            strings["endCursor"] = cursor
+        response = GRAPHQL.request(
+            lifecycle.CLOSING_PRS_QUERY,
+            strings=strings,
+            integers={"number": int(issue_number)},
+        )
+        pages.append(response)
+        connection = response.get("data", {}).get("repository", {}).get(
+            "issue", {}
+        ).get("closedByPullRequestsReferences")
+        page_info = connection.get("pageInfo") if isinstance(connection, dict) else None
+        if not isinstance(page_info, dict):
+            raise RuntimeError("closing pull-request query returned malformed pageInfo")
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise RuntimeError("closing pull-request query omitted its next-page cursor")
+    else:
+        raise RuntimeError("closing pull-request relation exceeded 20 pages")
+    result = lifecycle.closing_pull_requests(pages)
+    _LINKED_CLOSING_CACHE[key] = result
+    return result
+
+
+def linked_open_prs(
+    repository: str,
+    issue_number: str,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    pull_requests = linked_closing_prs(
+        repository, issue_number, refresh=refresh,
+    )
+    repository_errors = lifecycle.linked_pull_request_repository_errors(
+        pull_requests, repository,
+    )
+    if repository_errors:
+        raise RuntimeError("invalid closing pull-request relation:\n" + "\n".join(repository_errors))
+    return [pr for pr in pull_requests if pr["state"] == "OPEN"]
+
+
+def pull_request_queue_state(repository: str, pr_number: int | str) -> tuple[str, str | None]:
+    owner, name = repository.split("/", 1)
+    response = GRAPHQL.request(
+        lifecycle.PULL_REQUEST_QUEUE_QUERY,
+        strings={"owner": owner, "name": name},
+        integers={"number": int(pr_number)},
+    )
+    data = response.get("data") if isinstance(response, dict) else None
+    repo_data = data.get("repository") if isinstance(data, dict) else None
+    pull_request = repo_data.get("pullRequest") if isinstance(repo_data, dict) else None
+    node_id = pull_request.get("id") if isinstance(pull_request, dict) else None
+    entry = pull_request.get("mergeQueueEntry") if isinstance(pull_request, dict) else None
+    entry_id = entry.get("id") if isinstance(entry, dict) else None
+    if not isinstance(node_id, str) or not node_id \
+            or (entry is not None and (not isinstance(entry_id, str) or not entry_id)):
+        raise RuntimeError(
+            f"PR #{pr_number} merge-queue state is incomplete; reread GitHub before claiming"
+        )
+    return node_id, entry_id
+
+
+def lifecycle_pull_request(repository: str, pr_number: int | str) -> dict[str, Any]:
+    """Merge REST PR state with one targeted GraphQL closing relation."""
+    owner, name = repository.split("/", 1)
+    cursor: str | None = None
+    result = pull_request_state(repository, str(pr_number))
+    links: list[dict[str, Any]] = []
+    for _page in range(20):
+        strings = {"owner": owner, "name": name}
+        if cursor is not None:
+            strings["endCursor"] = cursor
+        response = GRAPHQL.request(
+            github.PULL_REQUEST_LIFECYCLE_QUERY,
+            strings=strings,
+            integers={"number": int(pr_number)},
+        )
+        repository_data = response.get("data", {}).get("repository")
+        pull_request = (
+            repository_data.get("pullRequest")
+            if isinstance(repository_data, dict) else None
+        )
+        if not isinstance(pull_request, dict):
+            raise RuntimeError(f"PR #{pr_number} lifecycle relation is unavailable")
+        connection = pull_request.get("closingIssuesReferences")
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        page_info = connection.get("pageInfo") if isinstance(connection, dict) else None
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise RuntimeError(f"PR #{pr_number} closing issues are incomplete")
+        links.extend(link for link in nodes if isinstance(link, dict))
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise RuntimeError(f"PR #{pr_number} closing issue pagination is invalid")
+    else:
+        raise RuntimeError(f"PR #{pr_number} closing issues exceeded 20 pages")
+    result["closingIssuesReferences"] = links
+    return result
+
+
+def dequeue_linked_prs(repository: str, pull_requests: list[dict[str, Any]]) -> None:
+    """Invalidate any queued merge authority before a claim can become live."""
+    for pull_request in pull_requests:
+        number = pull_request.get("number")
+        node_id = pull_request.get("id")
+        entry = pull_request.get("mergeQueueEntry")
+        entry_id = entry.get("id") if isinstance(entry, dict) else None
+        if not isinstance(node_id, str) or not node_id:
+            node_id, entry_id = pull_request_queue_state(repository, number)
+        if entry_id is None:
+            continue
+        GRAPHQL.request(
+            lifecycle.DEQUEUE_PULL_REQUEST_MUTATION,
+            strings={"id": node_id},
+        )
+        _confirmed_id, confirmed_entry = pull_request_queue_state(repository, number)
+        if confirmed_entry is not None:
+            raise RuntimeError(
+                f"PR #{number} remains in the merge queue; remove it from the queue and "
+                "rerun claim while keeping the PR ready"
+            )
+
+
+def claim_values(issue: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    values, errors = lifecycle.claim_comment_records(issue)
+    if errors:
+        raise RuntimeError("invalid canonical claim state:\n" + "\n".join(errors))
+    return values
+
+
+def claim_values_for_generation_rotation(
+    issue: dict[str, Any],
+    expected_generation_id: str | None = None,
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], str | None]:
+    """Permit only mismatch-only orphan state during authenticated recovery."""
+    values, errors = lifecycle.claim_comment_records(issue)
+    orphaned_id = lifecycle.orphaned_claim_generation_id(issue, values, errors)
+    if errors and orphaned_id is None:
+        raise RuntimeError("invalid canonical claim state:\n" + "\n".join(errors))
+    if expected_generation_id is not None and orphaned_id != expected_generation_id:
+        raise RuntimeError(
+            f"issue #{issue.get('number', '?')} orphaned claim generation changed during "
+            "authenticated recovery; reread GitHub and retry reconcile"
+        )
+    return values, orphaned_id
+
+
+def begin_orphan_recovery_generation(
+    repository: str,
+    number: str,
+    actor_login: str,
+    expected_generation_id: str,
+) -> dict[str, Any]:
+    """Rotate one verified orphan into a new server-owned empty generation."""
+    before = issue_state(repository, number)
+    require_open_claim_issue(before, number, "reconcile")
+    before_claims, _orphaned_id = claim_values_for_generation_rotation(
+        before, expected_generation_id,
+    )
+    if CLAIM_LABEL not in lifecycle.label_names(before) \
+            or any(lifecycle.claim_pair_active(pair) for pair in before_claims):
+        raise RuntimeError(
+            f"issue #{number} orphaned selector changed before recovery; reread GitHub"
+        )
+    remove_label(repository, number, CLAIM_LABEL, missing_ok=False)
+    unlabelled = issue_state(repository, number)
+    unlabelled_claims, _orphaned_id = claim_values_for_generation_rotation(
+        unlabelled, expected_generation_id,
+    )
+    if CLAIM_LABEL in lifecycle.label_names(unlabelled) \
+            or any(lifecycle.claim_pair_active(pair) for pair in unlabelled_claims):
+        raise RuntimeError(
+            f"issue #{number} orphaned selector did not clear; reread GitHub"
+        )
+    add_label(repository, number, CLAIM_LABEL)
+    generated = issue_state(repository, number)
+    require_open_claim_issue(generated, number, "reconcile")
+    generated_claims = claim_values(generated)
+    generation = generated.get("claimGeneration")
+    if not isinstance(generation, dict) \
+            or not generation.get("id") \
+            or generation.get("id") == expected_generation_id \
+            or str(generation.get("actorLogin") or "") != actor_login \
+            or not generation.get("actorNodeId") \
+            or CLAIM_LABEL not in lifecycle.label_names(generated) \
+            or any(lifecycle.claim_pair_active(pair) for pair in generated_claims):
+        raise RuntimeError(
+            f"issue #{number} authenticated orphan recovery generation did not settle; "
+            "reread GitHub before changing derived state"
+        )
+    return generated
+
+
+def verify_released_claims(
+    issue: dict[str, Any],
+    expected: dict[str, tuple[Any, ...]],
+    *,
+    recovery: str,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    records = claim_values(issue)
+    errors = [
+        error
+        for comment_id, values in expected.items()
+        if (error := lifecycle.released_claim_record_error(
+            records, comment_id, values[0], values[1],
+            values[2] if len(values) > 2 else None,
+        ))
+    ]
+    if errors:
+        raise RuntimeError(
+            "canonical claim release did not settle: " + "; ".join(errors)
+            + f"; {recovery}"
+        )
+    return records
+
+
+def claim_server_key(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[dt.datetime, int]:
+    try:
+        return lifecycle.claim_comment_server_key(pair)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def format_claim(payload: dict[str, Any]) -> str:
+    return CLAIM_MARKER + "\n```json\n" + json.dumps(payload, sort_keys=True) + "\n```"
+
+
+def format_heartbeat(payload: dict[str, Any]) -> str:
+    return HEARTBEAT_MARKER + "\n```json\n" + json.dumps(payload, sort_keys=True) + "\n```"
+
+
+def format_owner_repair(payload: dict[str, Any]) -> str:
+    return (
+        lifecycle.OWNER_REPAIR_MARKER + "\n```json\n"
+        + json.dumps(payload, sort_keys=True) + "\n```"
+    )
+
+
+def post_comment(repository: str, number: str, body: str) -> dict[str, Any]:
+    value = command_json([
+        "gh", "api", "--method", "POST",
+        f"repos/{repository}/issues/{number}/comments",
+        "-f", f"body={body}",
+    ])
+    if not isinstance(value, dict) or not value.get("node_id"):
+        raise RuntimeError(f"issue #{number} comment creation returned invalid state")
+    return value
+
+
+def add_label(repository: str, number: str, name: str) -> None:
+    command_json([
+        "gh", "api", "--method", "POST",
+        f"repos/{repository}/issues/{number}/labels",
+        "-f", f"labels[]={name}",
+    ])
+
+
+def remove_label(
+    repository: str,
+    number: str,
+    name: str,
+    *,
+    missing_ok: bool = True,
+) -> None:
+    result = command([
+        "gh", "api", "--method", "DELETE",
+        f"repos/{repository}/issues/{number}/labels/{quote(name, safe='')}",
+    ], check=False)
+    if result.returncode and not (
+        missing_ok and "HTTP 404" in (result.stderr + result.stdout)
+    ):
+        raise RuntimeError(
+            result.stderr.strip() or result.stdout.strip() or "label removal failed"
+        )
+
+
+def ensure_label(repository: str, name: str, color: str, description: str) -> None:
+    endpoint = f"repos/{repository}/labels/{quote(name, safe='')}"
+    existing = command(["gh", "api", endpoint], check=False)
+    if existing.returncode == 0:
+        return
+    if "HTTP 404" not in (existing.stderr + existing.stdout):
+        raise RuntimeError(
+            existing.stderr.strip() or existing.stdout.strip() or "label read failed"
+        )
+    command_json([
+        "gh", "api", "--method", "POST", f"repos/{repository}/labels",
+        "-f", f"name={name}", "-f", f"color={color}",
+        "-f", f"description={description}",
+    ])
+
+
+def project_coordinates(project_url: str) -> tuple[str, str] | None:
+    """Return the owner and project number from a canonical Project v2 URL."""
+    match = re.fullmatch(
+        r"https://github\.com/(?:orgs|users)/([^/]+)/projects/(\d+)",
+        project_url.rstrip("/"),
+    )
+    return (match.group(1), match.group(2)) if match else None
+
+
+def mark_pull_request_ready(repository: str, pull_request: dict[str, Any]) -> None:
+    node_id = str(pull_request.get("id") or "")
+    number = str(pull_request.get("number") or "")
+    if not node_id or not number:
+        raise RuntimeError("linked pull request lacks ready-state identity")
+    response = GRAPHQL.request(
+        github.MARK_PULL_REQUEST_READY_MUTATION,
+        strings={"id": node_id},
+    )
+    ready = response.get("data", {}).get(
+        "markPullRequestReadyForReview", {}
+    ).get("pullRequest")
+    if not isinstance(ready, dict) or ready.get("isDraft") is not False:
+        raise RuntimeError(f"PR #{number} did not become ready for review")
+
+
+def pull_request_state(repository: str, number: str) -> dict[str, Any]:
+    return github.pull_request_state(command_json, RuntimeError, repository, number)
+
+
+def pull_request_commits(repository: str, number: str) -> list[dict[str, Any]]:
+    return github.pull_request_commits(command_json, RuntimeError, repository, number)
+
+
+def post_heartbeat(repository: str, number: str, payload: dict[str, Any]) -> None:
+    post_comment(repository, number, format_heartbeat(payload))
+
+
+def post_owner_repair(repository: str, number: str, payload: dict[str, Any]) -> None:
+    post_comment(repository, number, format_owner_repair(payload))
+
+
+def update_comment(repository: str, comment: dict[str, Any], body: str) -> None:
+    database_id = lifecycle.comment_database_id(comment)
+    if database_id is None:
+        raise RuntimeError("authority comment lacks a REST database id")
+    value = command_json([
+        "gh", "api", "--method", "PATCH",
+        f"repos/{repository}/issues/comments/{database_id}",
+        "-f", f"body={body}",
+    ])
+    if not isinstance(value, dict) \
+            or str(value.get("node_id") or "") != str(comment.get("id") or ""):
+        raise RuntimeError(
+            f"authority comment {comment.get('id')} REST update did not settle"
+        )
+
+
+def set_project_status(issue_url: str, status: str, manifest: dict[str, Any]) -> None:
+    PROJECTS.set_status(issue_url, status, manifest)
+
+
+def project_item_status(issue_url: str, manifest: dict[str, Any]) -> str | None:
+    """Return one issue's targeted Project v2 Status without a board scan."""
+    return PROJECTS.status(issue_url, manifest)
+
+
+def project_sync_items(args: argparse.Namespace) -> int:
+    manifest = load(Path(args.repo_path).resolve() / ".agents" / "project.yaml")
+    if not args.apply:
+        print(
+            f"dry-run: synchronize {len(args.project_requests)} noncritical "
+            "Project v2 items; pass --apply to mutate state"
+        )
+    PROJECTS.project_sync(
+        args.project_requests,
+        manifest,
+        apply=bool(args.apply),
+    )
+    return 0
+
+
+def verify_project_status(
+    issue_url: str,
+    expected: str,
+    manifest: dict[str, Any],
+    *,
+    recovery: str,
+) -> None:
+    if not manifest.get("tracker", {}).get("project_url"):
+        return
+    actual = PROJECTS.status(issue_url, manifest, refresh=True)
+    if actual != expected:
+        raise RuntimeError(
+            f"project state for {issue_url} is {actual or 'missing'}, expected {expected}; "
+            f"correct project access/state and {recovery}"
+        )
+
+
+def reconcile_project_done(manifest: dict[str, Any], apply: bool) -> int:
+    """Bounded background-only sweep from Review to Done after a merged PR."""
+    if PROJECTS.status_target(manifest, "Done") is None:
+        return 0
+    completed = 0
+    for item in PROJECTS.background_items(manifest):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        field = item.get("fieldValueByName")
+        if not isinstance(field, dict) or field.get("name") != "Review" \
+                or not isinstance(content, dict) \
+                or content.get("state") != "CLOSED":
+            continue
+        issue_url = content.get("url")
+        repository = (content.get("repository") or {}).get("nameWithOwner")
+        number = content.get("number")
+        if not issue_url or not repository or not number:
+            continue
+        merged = next(
+            (
+                pr for pr in linked_closing_prs(
+                    str(repository), str(number), refresh=True,
+                )
+                if pr.get("state") == "MERGED"
+            ),
+            None,
+        )
+        if merged is None:
+            continue
+        merged_pr = f"https://github.com/{repository}/pull/{merged['number']}"
+        if apply:
+            set_project_status(str(issue_url), "Done", manifest)
+            verify_project_status(
+                str(issue_url),
+                "Done",
+                manifest,
+                recovery="rerun `hv-agent reconcile --all --apply`",
+            )
+        completed += 1
+        print(f"{'complete' if apply else 'would complete'} {issue_url} after {merged_pr}")
+    return completed
+
+
+def ready_linked_agent_prs(repository: str, issue_number: str) -> list[dict[str, Any]]:
+    linked = [
+        pr for pr in linked_open_prs(repository, issue_number)
+        if RUN_MARKER in str(pr.get("body") or "")
+    ]
+    for pr in linked:
+        pr_number = str(pr["number"])
+        if pr.get("isDraft"):
+            mark_pull_request_ready(repository, pr)
+            pr["isDraft"] = False
+        remove_label(repository, pr_number, BLOCKED_LABEL)
+    return linked
+
+
+def validate_claim_invocation(payload: dict[str, Any], args: argparse.Namespace) -> None:
+    expected = {
+        "runtime": args.runtime,
+        "owner": args.owner,
+        "session": args.session,
+        "branch": args.branch,
+        "worktree": args.worktree,
+    }
+    mismatches = [
+        name for name, value in expected.items() if payload.get(name) != value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "active claim identity differs for " + ", ".join(mismatches)
+            + "; resume with the original runtime/owner/session/branch/worktree "
+            "or intentionally release and reacquire"
+        )
+
+
+def require_open_claim_issue(issue: dict[str, Any], number: str, action: str) -> None:
+    if issue.get("state") != "OPEN":
+        raise RuntimeError(
+            f"issue #{number} is {str(issue.get('state') or 'unknown').lower()}; "
+            f"cannot {action} implementation authority on closed work"
+        )
+
+
+def require_claim_actor(payload: dict[str, Any], action: str) -> str:
+    """Bind a claim mutation to the authenticated canonical owner."""
+    owner = str(payload.get("owner") or "")
+    app_slug = os.environ.get("HV_AGENT_APP_SLUG")
+    if app_slug:
+        # The authority artifact runs with an installation token, which has no
+        # GET /user endpoint. Its claimed App identity is instead proven by a
+        # server-attributed status the same token wrote on the exact generated
+        # transition head. Environment variables select the App; GitHub's
+        # status creator is the non-forgeable token binding.
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}", app_slug):
+            raise RuntimeError("HV_AGENT_APP_SLUG must be a GitHub App slug")
+        transition = payload.get("generated_transition")
+        if not isinstance(transition, dict) \
+                or transition.get("runtime") != "github-actions" \
+                or transition.get("session") != payload.get("session") \
+                or not isinstance(transition.get("head_sha"), str) \
+                or not re.fullmatch(r"[0-9a-f]{40}", transition["head_sha"]):
+            raise RuntimeError(
+                "GitHub App claim mutation requires an exact generated transition head"
+            )
+        actor = f"{app_slug}[bot]"
+        proof_repository = os.environ.get("HV_AGENT_APP_PROOF_REPOSITORY")
+        if proof_repository != "happyvertical/.github":
+            raise RuntimeError(
+                "GitHub App claim mutation requires the protected authority proof repository"
+            )
+        context = f"hv-agent/producer/{payload.get('session')}"
+        statuses = commit_statuses(proof_repository, transition["head_sha"])
+        if not any(
+            status.get("context") == context
+            and status.get("state") == "success"
+            and (status.get("creator") or {}).get("login") == actor
+            and status.get("sha") in {None, transition["head_sha"]}
+            for status in statuses
+        ):
+            raise RuntimeError(
+                f"GitHub App token is not bound to a server-attributed {actor!r} "
+                "producer status on the exact generated transition head"
+            )
+    else:
+        actor_data = command_json(["gh", "api", "user"])
+        actor = str(actor_data.get("login") or "") \
+            if isinstance(actor_data, dict) else ""
+    if not actor or actor != owner:
+        raise RuntimeError(
+            f"authenticated GitHub actor {actor or 'unknown'} does not own this "
+            f"claim (canonical owner: {owner or 'missing'}); only the canonical "
+            f"owner may {action} it"
+        )
+    return actor
+
+
+def invalidate_closed_claim_cycle(
+    repository: str,
+    number: str,
+    issue_url: str,
+    comment_id: str,
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    *,
+    raise_after: bool = True,
+) -> None:
+    """Release authority that lost to issue closure and restore derived state."""
+    issue = issue_state(repository, number)
+    if issue.get("state") != "CLOSED":
+        raise RuntimeError(
+            f"issue #{number} reopened before closed-issue invalidation; no claim "
+            "cycle was released, so preserve the current authority and rerun claim"
+        )
+    matches = [
+        pair for pair in claim_values(issue)
+        if str(pair[0].get("id")) == str(comment_id)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"issue #{number} closed while claim cycle {comment_id} became ambiguous; "
+            "run the trusted hv-agent reconcile ISSUE --apply before claiming again"
+        )
+    comment, payload = matches[0]
+    if payload.get("released_at") and payload.get("release_reason") != "race-lost":
+        raise RuntimeError(
+            f"issue #{number} closed while claim cycle {comment_id} was settling, "
+            f"but that cycle is already released as {payload.get('release_reason')}; "
+            "run the trusted hv-agent reconcile ISSUE --apply instead of rewriting history"
+        )
+    expected = {str(comment["id"]): ("race-lost", None)}
+    if not payload.get("released_at"):
+        payload["released_at"] = lifecycle.ordered_release_timestamp(
+            payload, timestamp(),
+        )
+        payload["release_reason"] = "race-lost"
+        update_comment(repository, comment, format_claim(payload))
+    verify_released_claims(
+        issue_state(repository, number),
+        expected,
+        recovery="run the trusted hv-agent reconcile ISSUE --apply to settle the closed issue",
+    )
+    restore = str(payload.get("project_status_before_claim") or "Review")
+    if restore == "In Progress":
+        restore = "Review"
+    _settled, replacement_restored = settle_closed_claim_state(
+        repository,
+        number,
+        linked_open_prs(repository, number),
+        manifest,
+        fallback_status=restore,
+        expected_releases=expected,
+        manage_project=not getattr(args, "no_project", False),
+        recovery=(
+            "run the trusted hv-agent reconcile ISSUE --apply to settle the closed issue"
+        ),
+    )
+    if replacement_restored:
+        message = (
+            f"issue #{number} reopened while claim cycle {comment_id} was being "
+            "invalidated; the old cycle was released as race-lost and the live "
+            "replacement claim was preserved In Progress"
+        )
+    else:
+        message = (
+            f"issue #{number} closed while claim cycle {comment_id} was settling; "
+            "the cycle was released as race-lost and terminal derived state restored"
+        )
+    if raise_after:
+        raise RuntimeError(message)
+    print(message)
+
+
+def settle_active_claim_state(
+    repository: str,
+    number: str,
+    issue_url: str,
+    expected_comment_id: str,
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+) -> None:
+    """Repair derived claim state and confirm one unchanged authority."""
+    initial_issue = issue_state(repository, number)
+    if initial_issue.get("state") != "OPEN":
+        invalidate_closed_claim_cycle(
+            repository, number, issue_url, expected_comment_id, args, manifest,
+        )
+    ensure_label(
+        repository, CLAIM_LABEL, "1d76db", "Exclusive active implementation claim",
+    )
+    ensure_label(
+        repository, BLOCKED_LABEL, "b60205", "Reviewable but blocked from merge",
+    )
+    if CLAIM_LABEL not in lifecycle.label_names(initial_issue) \
+            and initial_issue.get("authorityMetadataComplete"):
+        raise RuntimeError(
+            f"issue #{number} active claim lost agent: implementation; do not re-add "
+            "the label onto the old generation—release or hand off that exact cycle and "
+            "acquire a fresh claim generation"
+        )
+    if CLAIM_LABEL not in lifecycle.label_names(initial_issue):
+        # Direct legacy fixtures lack the server timeline/generation contract.
+        add_label(repository, number, CLAIM_LABEL)
+    remove_label(repository, number, BLOCKED_LABEL)
+    dequeue_linked_prs(
+        repository, linked_open_prs(repository, number, refresh=True),
+    )
+    pre_project_issue = issue_state(repository, number)
+    if pre_project_issue.get("state") != "OPEN":
+        invalidate_closed_claim_cycle(
+            repository, number, issue_url, expected_comment_id, args, manifest,
+        )
+    linked = ready_linked_agent_prs(repository, number)
+    if not args.no_project:
+        set_project_status(issue_url, "In Progress", manifest)
+    settled = verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="rerun claim with the original implementation identity",
+    )
+    if settled.get("state") != "OPEN":
+        invalidate_closed_claim_cycle(
+            repository, number, issue_url, expected_comment_id, args, manifest,
+        )
+    live = [pair for pair in claim_values(settled) if lifecycle.claim_pair_active(pair)]
+    if len(live) != 1:
+        raise RuntimeError(
+            f"issue #{number} has {len(live)} active claims after claim settlement; "
+            "run `hv-agent reconcile ISSUE --apply` to settle deterministic losers before retrying"
+        )
+    comment, payload = live[0]
+    if str(comment.get("id")) != str(expected_comment_id):
+        raise RuntimeError(
+            f"issue #{number} claim authority changed during settlement; inspect and "
+            "release the unexpected claim before retrying"
+        )
+    validate_claim_invocation(payload, args)
+    if not args.no_project:
+        verify_project_status(
+            issue_url,
+            "In Progress",
+            manifest,
+            recovery="rerun claim with the original identity",
+        )
+
+
+def begin_claim_generation(
+    repository: str,
+    number: str,
+    owner_login: str,
+) -> dict[str, Any]:
+    """Create one server-owned label generation before posting its claim."""
+    before = issue_state(repository, number)
+    require_open_claim_issue(before, number, "start a claim generation for")
+    if any(lifecycle.claim_pair_active(pair) for pair in claim_values(before)):
+        raise RuntimeError(
+            f"issue #{number} gained an active claim before generation creation; "
+            "reread it and do not overlap that implementation"
+        )
+    previous = before.get("claimGeneration")
+    previous_id = previous.get("id") if isinstance(previous, dict) else None
+    if CLAIM_LABEL in lifecycle.label_names(before):
+        remove_label(repository, number, CLAIM_LABEL, missing_ok=False)
+    unlabelled = issue_state(repository, number)
+    require_open_claim_issue(unlabelled, number, "start a claim generation for")
+    if CLAIM_LABEL in lifecycle.label_names(unlabelled):
+        raise RuntimeError(
+            f"issue #{number} implementation selector changed concurrently; reread "
+            "the current claim generation before retrying"
+        )
+    if any(lifecycle.claim_pair_active(pair) for pair in claim_values(unlabelled)):
+        raise RuntimeError(
+            f"issue #{number} gained an active claim while its selector was being "
+            "prepared; reconcile derived state before retrying"
+        )
+    add_label(repository, number, CLAIM_LABEL)
+    generated = issue_state(repository, number)
+    require_open_claim_issue(generated, number, "post a claim comment for")
+    if not generated.get("authorityMetadataComplete"):
+        # Direct unit fixtures can omit the GitHub timeline transport.
+        return generated
+    generation = generated.get("claimGeneration")
+    if not isinstance(generation, dict) \
+            or not generation.get("id") \
+            or generation.get("id") == previous_id \
+            or not generation.get("actorNodeId") \
+            or str(generation.get("actorLogin") or "") != owner_login:
+        raise RuntimeError(
+            f"issue #{number} claim-generation authority did not settle for the "
+            "authenticated actor; do not post a claim and retry after rereading GitHub"
+        )
+    return generated
+
+
+def claim_issue(args: argparse.Namespace) -> int:
+    repo = Path(args.repo_path).resolve()
+    if args.no_project:
+        if not getattr(args, "repo", None):
+            raise RuntimeError("claim --no-project requires --repo OWNER/REPO")
+        require_no_project_repository(repo, args.repo)
+        manifest = None
+        repository = args.repo
+    else:
+        manifest = load(repo / ".agents" / "project.yaml")
+        lifecycle.require_github_tracker(manifest, "claim")
+        repository = manifest["tracker"]["repository"]
+    number = str(args.issue)
+    authenticated_actor = command_json(["gh", "api", "user"])
+    authenticated_owner = str(authenticated_actor.get("login", ""))
+    if not authenticated_owner or args.owner != authenticated_owner:
+        raise RuntimeError(
+            f"claim owner {args.owner!r} must match authenticated GitHub login "
+            f"{authenticated_owner!r}"
+        )
+    issue = issue_state(repository, number)
+    require_open_claim_issue(issue, number, "claim")
+    claims = claim_values(issue)
+    live = [pair for pair in claims if lifecycle.claim_pair_active(pair)]
+    if live:
+        if len(live) != 1:
+            raise RuntimeError(
+                f"issue #{number} has overlapping active claims; run "
+                "`hv-agent reconcile ISSUE --apply` to settle deterministic losers before retrying"
+            )
+        comment, payload = live[0]
+        if payload.get("session") != args.session:
+            raise RuntimeError(f"issue already claimed by session {payload.get('session')}")
+        validate_claim_invocation(payload, args)
+        settle_active_claim_state(
+            repository,
+            number,
+            str(issue["url"]),
+            str(comment["id"]),
+            args,
+            manifest,
+        )
+        print(f"claim already active for this session; claim_comment_id={comment['id']}")
+        return 0
+    prior_status = None if args.no_project else project_item_status(issue["url"], manifest)
+    payload = {
+        "schema": "hv-agent-claim:v1",
+        "runtime": args.runtime,
+        "owner": args.owner,
+        "session": args.session,
+        "branch": args.branch,
+        "worktree": args.worktree,
+        "claimed_at": timestamp(),
+        "heartbeat_at": timestamp(),
+        "lease_seconds": LEASE_SECONDS,
+    }
+    if prior_status and prior_status != "In Progress":
+        payload["project_status_before_claim"] = prior_status
+    dequeue_linked_prs(
+        repository, linked_open_prs(repository, number, refresh=True),
+    )
+    expired_releases: dict[str, tuple[str, str | None]] = {}
+    for expired_comment, expired_payload in claims:
+        if expired_payload.get("released_at"):
+            continue
+        expired_payload["released_at"] = lifecycle.ordered_release_timestamp(
+            expired_payload, timestamp(),
+        )
+        expired_payload["release_reason"] = (
+            "expired" if lifecycle.claim_pair_current(
+                (expired_comment, expired_payload)
+            ) else "race-lost"
+        )
+        update_comment(repository, expired_comment, format_claim(expired_payload))
+        expired_releases[str(expired_comment["id"])] = (
+            str(expired_payload["release_reason"]), None,
+        )
+    if expired_releases:
+        verify_released_claims(
+            issue_state(repository, number),
+            expired_releases,
+            recovery="reread the expired claim cycles and rerun claim",
+        )
+    ensure_label(
+        repository, CLAIM_LABEL, "1d76db", "Exclusive active implementation claim",
+    )
+    ensure_label(
+        repository, BLOCKED_LABEL, "b60205", "Reviewable but blocked from merge",
+    )
+    begin_claim_generation(repository, number, authenticated_owner)
+    post_comment(repository, number, format_claim(payload))
+    reread = issue_state(repository, number)
+    live = [pair for pair in claim_values(reread) if lifecycle.claim_pair_active(pair)]
+    if not live:
+        raise RuntimeError(
+            f"issue #{number} claim generation changed before the comment settled; "
+            "do not treat this session as claimed and retry after reconciliation"
+        )
+    winner_comment, winner_payload = min(live, key=claim_server_key)
+    own_live = [pair for pair in live if pair[1].get("session") == args.session]
+    if winner_payload.get("session") != args.session:
+        for own_comment, own_payload in own_live:
+            own_payload["released_at"] = lifecycle.ordered_release_timestamp(
+                own_payload, timestamp(),
+            )
+            own_payload["release_reason"] = "race-lost"
+            update_comment(repository, own_comment, format_claim(own_payload))
+        raise RuntimeError("claim race lost")
+    for own_comment, own_payload in own_live:
+        if own_comment.get("id") == winner_comment.get("id"):
+            continue
+        own_payload["released_at"] = lifecycle.ordered_release_timestamp(
+            own_payload, timestamp(),
+        )
+        own_payload["release_reason"] = "duplicate"
+        update_comment(repository, own_comment, format_claim(own_payload))
+    settle_active_claim_state(
+        repository,
+        number,
+        str(issue["url"]),
+        str(winner_comment["id"]),
+        args,
+        manifest,
+    )
+    print(f"claimed {repository}#{number}; claim_comment_id={winner_comment['id']}")
+    return 0
+
+
+def own_claim(
+    repository: str,
+    number: str,
+    session: str,
+    claim_comment_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    issue = issue_state(repository, number)
+    values = [
+        pair for pair in claim_values(issue)
+        if lifecycle.claim_pair_current(pair) and pair[1].get("session") == session
+    ]
+    if not values:
+        raise RuntimeError(f"no claim found for session {session}")
+    if claim_comment_id:
+        selected = [pair for pair in values if str(pair[0].get("id")) == claim_comment_id]
+        if len(selected) != 1:
+            raise RuntimeError(
+                f"session {session} has no claim cycle with comment id {claim_comment_id}; "
+                "reread the issue and use the canonical claim comment id"
+            )
+        return selected[0]
+    if len(values) != 1:
+        raise RuntimeError(
+            f"session {session} has {len(values)} claim cycles; pass --claim-comment-id "
+            "with the cycle printed by claim so a delayed retry cannot release another cycle"
+        )
+    return values[0]
+
+
+def active_own_claim(
+    repository: str,
+    number: str,
+    session: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the sole globally active claim only when this session owns it."""
+    issue = issue_state(repository, number)
+    require_open_claim_issue(issue, number, "heartbeat")
+    values = claim_values(issue)
+    live = [pair for pair in values if lifecycle.claim_pair_active(pair)]
+    if not live:
+        own_history = [payload for _, payload in values if payload.get("session") == session]
+        state = "released" if any(payload.get("released_at") for payload in own_history) else "expired"
+        raise RuntimeError(
+            f"session {session} has no active claim ({state} or history-only); "
+            "reacquire the issue before heartbeating"
+        )
+    if len(live) != 1:
+        raise RuntimeError(
+            f"issue #{number} has overlapping active claims; run "
+            "`hv-agent reconcile ISSUE --apply` before heartbeating"
+        )
+    comment, payload = live[0]
+    if payload.get("session") != session:
+        raise RuntimeError(
+            f"issue #{number} is actively claimed by session {payload.get('session')}; "
+            "do not heartbeat a historical claim"
+        )
+    return comment, payload
+
+
+def heartbeat_issue(args: argparse.Namespace) -> int:
+    manifest = load(Path(args.repo_path).resolve() / ".agents" / "project.yaml")
+    lifecycle.require_github_tracker(manifest, "heartbeat")
+    repository = manifest["tracker"]["repository"]
+    number = str(args.issue)
+    try:
+        initial_comment, _initial_payload = active_own_claim(
+            repository, number, args.session,
+        )
+    except RuntimeError:
+        legacy_owner = getattr(args, "repair_legacy_owner", None)
+        if not legacy_owner:
+            raise
+        branch = str(getattr(args, "branch", None) or "")
+        worktree = str(getattr(args, "worktree", None) or "")
+        actor_data = command_json(["gh", "api", "user"])
+        actor = str(actor_data.get("login") or "") \
+            if isinstance(actor_data, dict) else ""
+        if not actor:
+            raise RuntimeError(
+                "could not resolve the authenticated GitHub login required for "
+                "legacy claim owner repair"
+            )
+        try:
+            repair_issue = issue_state(repository, number)
+            require_open_claim_issue(repair_issue, number, "repair claim owner for")
+            initial_comment, _repair_payload = \
+                lifecycle.legacy_owner_repair_candidate(
+                    repair_issue,
+                    actor=actor,
+                    legacy_owner=str(legacy_owner),
+                    session=args.session,
+                    branch=branch,
+                    worktree=worktree,
+                    at=dt.datetime.now(dt.timezone.utc),
+                )
+            repair_issue = issue_state(repository, number)
+            require_open_claim_issue(repair_issue, number, "repair claim owner for")
+            selected_comment, repair_payload = \
+                lifecycle.legacy_owner_repair_candidate(
+                    repair_issue,
+                    actor=actor,
+                    legacy_owner=str(legacy_owner),
+                    session=args.session,
+                    branch=branch,
+                    worktree=worktree,
+                    at=dt.datetime.now(dt.timezone.utc),
+                )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if str(selected_comment.get("id")) != str(initial_comment.get("id")):
+            raise RuntimeError(
+                "legacy claim cycle changed before owner repair; inspect canonical "
+                "history and recover manually"
+            )
+        post_owner_repair(repository, number, repair_payload)
+        initial_comment, _initial_payload = active_own_claim(
+            repository, number, args.session,
+        )
+        if str(initial_comment.get("id")) != str(selected_comment.get("id")):
+            raise RuntimeError(
+                "legacy claim owner repair did not settle on the selected cycle; "
+                "inspect canonical history before continuing"
+            )
+    linked = [
+        pr for pr in linked_open_prs(repository, number)
+        if RUN_MARKER in str(pr.get("body") or "")
+    ]
+    verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="rerun claim with the original implementation identity",
+    )
+    # Label and linked-PR verification may make several remote reads. Reread
+    # the canonical cycle only after those checks so a concurrent release
+    # cannot be overwritten with the stale payload captured above.
+    comment, payload = active_own_claim(repository, number, args.session)
+    if str(comment.get("id")) != str(initial_comment.get("id")):
+        raise RuntimeError(
+            f"issue #{number} claim authority changed before heartbeat mutation; "
+            "inspect and release the unexpected claim before continuing"
+        )
+    heartbeat_at = timestamp()
+    mutation_time = dt.datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+    if not active_claim(payload, mutation_time):
+        raise RuntimeError(
+            f"session {args.session} claim expired before heartbeat mutation; "
+            "reacquire the issue instead of reviving history"
+        )
+    prior_heartbeat = lifecycle.parse_timestamp(payload.get("heartbeat_at"))
+    require_claim_actor(payload, "heartbeat")
+    post_heartbeat(repository, number, {
+        "schema": "hv-agent-heartbeat:v1",
+        "claim_comment_id": str(comment["id"]),
+        "session": args.session,
+        "heartbeat_at": heartbeat_at,
+    })
+    confirmed_comment, confirmed_payload = active_own_claim(
+        repository, number, args.session,
+    )
+    if str(confirmed_comment.get("id")) != str(comment.get("id")):
+        raise RuntimeError(
+            f"issue #{number} claim authority changed during heartbeat; inspect and "
+            "release the unexpected claim before continuing"
+        )
+    confirmed_heartbeat = lifecycle.parse_timestamp(confirmed_payload.get("heartbeat_at"))
+    if prior_heartbeat is None or confirmed_heartbeat is None \
+            or confirmed_heartbeat <= prior_heartbeat:
+        raise RuntimeError(
+            f"issue #{number} server-timed heartbeat renewal was not confirmed on the "
+            "canonical claim cycle; reread GitHub and retry without reviving history"
+        )
+    verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="reacquire the issue before continuing",
+    )
+    print(
+        f"heartbeat {confirmed_payload['heartbeat_at']} "
+        f"claim_comment_id={comment['id']}"
+    )
+    return 0
+
+
+def verify_lifecycle_labels(
+    repository: str,
+    number: str,
+    linked: list[dict[str, Any]],
+    *,
+    claim_present: bool,
+    blocked: bool,
+    recovery: str,
+) -> dict[str, Any]:
+    """Reread every lifecycle label and reject incomplete transition state."""
+    issue = issue_state(repository, number)
+    if not claim_present and any(
+        lifecycle.claim_pair_active(pair) for pair in claim_values(issue)
+    ):
+        return issue
+    pr_states: list[tuple[str, dict[str, Any]]] = []
+    for pr in linked:
+        pr_number = str(pr["number"])
+        pr_states.append((
+            pr_number,
+            pull_request_state(repository, pr_number),
+        ))
+    errors = lifecycle.lifecycle_label_errors(
+        number,
+        issue,
+        pr_states,
+        claim_label=CLAIM_LABEL,
+        blocked_label=BLOCKED_LABEL,
+        claim_present=claim_present,
+        blocked=blocked,
+    )
+    errors.extend(
+        f"PR #{pr_number} remains draft; mark it ready and {recovery}"
+        for pr_number, state in pr_states if state.get("isDraft")
+    )
+    if errors:
+        raise RuntimeError(
+            "lifecycle label state is incomplete: " + "; ".join(errors)
+            + f"; correct permissions/state and {recovery}"
+        )
+    return issue
+
+
+def restore_live_claim_state(
+    repository: str,
+    number: str,
+    linked: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    fallback_status: str,
+    expected_releases: dict[str, tuple[Any, ...]],
+    *,
+    recovery: str,
+    manage_project: bool = True,
+) -> bool:
+    """Restore exactly one live replacement, or report that it disappeared."""
+    initial = issue_state(repository, number)
+    if initial.get("state") != "OPEN":
+        raise RuntimeError(
+            f"issue #{number} closed before live-claim restoration; rerun "
+            "`hv-agent reconcile ISSUE --apply` to release every remaining cycle as race-lost"
+        )
+    initial_live = [
+        pair for pair in verify_released_claims(
+            initial, expected_releases, recovery=recovery,
+        )
+        if lifecycle.claim_pair_active(pair)
+    ]
+    if len(initial_live) > 1:
+        raise RuntimeError(
+            f"issue #{number} has overlapping active claims during restoration; "
+            "rerun `hv-agent reconcile ISSUE --apply` before continuing"
+        )
+    if not initial_live:
+        return False
+    if CLAIM_LABEL not in lifecycle.label_names(initial) \
+            and initial.get("authorityMetadataComplete"):
+        raise RuntimeError(
+            f"issue #{number} live claim lost its server-owned label generation; do not "
+            "re-add the selector—release or hand off that exact cycle and acquire a fresh "
+            "generation"
+        )
+    add_label(repository, number, CLAIM_LABEL)
+    remove_label(repository, number, BLOCKED_LABEL)
+    for pr in linked:
+        pr_number = str(pr["number"])
+        remove_label(repository, pr_number, BLOCKED_LABEL)
+        if pr.get("isDraft"):
+            mark_pull_request_ready(repository, pr)
+            pr["isDraft"] = False
+    issue = verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="rerun claim for the live implementation session",
+    )
+    if issue.get("state") != "OPEN":
+        raise RuntimeError(
+            f"issue #{number} closed during live-claim restoration; rerun "
+            "`hv-agent reconcile ISSUE --apply` to release every remaining cycle as race-lost"
+        )
+    live = [
+        pair for pair in verify_released_claims(
+            issue, expected_releases, recovery=recovery,
+        )
+        if lifecycle.claim_pair_active(pair)
+    ]
+    if len(live) > 1:
+        raise RuntimeError(
+            f"issue #{number} has overlapping active claims during restoration; "
+            "rerun `hv-agent reconcile ISSUE --apply` before continuing"
+        )
+    if not live:
+        return False
+    confirmed = verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="rerun claim for the live implementation session",
+    )
+    if confirmed.get("state") != "OPEN":
+        raise RuntimeError(
+            f"issue #{number} closed during live-claim restoration; rerun "
+            "`hv-agent reconcile ISSUE --apply` to release every remaining cycle as race-lost"
+        )
+    confirmed_live = [
+        pair for pair in verify_released_claims(
+            confirmed, expected_releases, recovery=recovery,
+        )
+        if lifecycle.claim_pair_active(pair)
+    ]
+    if len(confirmed_live) > 1:
+        raise RuntimeError(
+            f"issue #{number} has overlapping active claims during restoration; "
+            "rerun `hv-agent reconcile ISSUE --apply` before continuing"
+        )
+    if not confirmed_live:
+        return False
+    if not manage_project:
+        return True
+    set_project_status(confirmed["url"], "In Progress", manifest)
+    verify_project_status(
+        str(confirmed["url"]),
+        "In Progress",
+        manifest,
+        recovery="rerun claim for the live implementation session",
+    )
+    after_project = verify_lifecycle_labels(
+        repository,
+        number,
+        linked,
+        claim_present=True,
+        blocked=False,
+        recovery="rerun claim for the live implementation session",
+    )
+    if after_project.get("state") != "OPEN":
+        set_project_status(after_project["url"], fallback_status, manifest)
+        verify_project_status(
+            str(after_project["url"]),
+            fallback_status,
+            manifest,
+            recovery="rerun `hv-agent reconcile ISSUE --apply` after closure compensation",
+        )
+        raise RuntimeError(
+            f"issue #{number} closed during live-claim restoration; project state was "
+            f"restored to {fallback_status}, so rerun `hv-agent reconcile ISSUE --apply` to "
+            "release every remaining cycle as race-lost"
+        )
+    after_project_live = [
+        pair for pair in verify_released_claims(
+            after_project, expected_releases, recovery=recovery,
+        )
+        if lifecycle.claim_pair_active(pair)
+    ]
+    if len(after_project_live) > 1:
+        raise RuntimeError(
+            f"issue #{number} has overlapping active claims during restoration; "
+            "rerun `hv-agent reconcile ISSUE --apply` before continuing"
+        )
+    if after_project_live:
+        return True
+    set_project_status(after_project["url"], fallback_status, manifest)
+    verify_project_status(
+        str(after_project["url"]),
+        fallback_status,
+        manifest,
+        recovery="rerun the interrupted release command",
+    )
+    return False
+
+
+def settle_closed_claim_state(
+    repository: str,
+    number: str,
+    linked: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    *,
+    fallback_status: str,
+    expected_releases: dict[str, tuple[Any, ...]],
+    manage_project: bool,
+    recovery: str,
+) -> tuple[dict[str, Any], bool]:
+    """Settle a confirmed closed snapshot without clobbering a replacement."""
+    for _attempt in range(3):
+        issue = issue_state(repository, number)
+        records = verify_released_claims(
+            issue, expected_releases, recovery=recovery,
+        )
+        live = [pair for pair in records if lifecycle.claim_pair_active(pair)]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} has overlapping active claims during closed-issue "
+                "settlement; rerun `hv-agent reconcile ISSUE --apply`"
+            )
+        if live:
+            if issue.get("state") != "OPEN":
+                add_label(repository, number, CLAIM_LABEL)
+                raise RuntimeError(
+                    f"closed issue #{number} gained another live claim; preserve the "
+                    "selector and run trusted reconciliation"
+                )
+            if restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                fallback_status,
+                expected_releases,
+                recovery=recovery,
+                manage_project=manage_project,
+            ):
+                return issue, True
+            continue
+        if issue.get("state") != "CLOSED":
+            raise RuntimeError(
+                f"issue #{number} reopened during closed-issue settlement; the "
+                f"{CLAIM_LABEL} selector was retained, so run trusted reconciliation"
+            )
+
+        remove_label(repository, number, CLAIM_LABEL)
+        settled = issue_state(repository, number)
+        records = verify_released_claims(
+            settled, expected_releases, recovery=recovery,
+        )
+        live = [pair for pair in records if lifecycle.claim_pair_active(pair)]
+        if live or settled.get("state") != "CLOSED":
+            if live and settled.get("state") == "OPEN" and restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                fallback_status,
+                expected_releases,
+                recovery=recovery,
+                manage_project=manage_project,
+            ):
+                return settled, True
+            add_label(repository, number, CLAIM_LABEL)
+            raise RuntimeError(
+                f"issue #{number} changed while its closed-issue selector was being "
+                "removed; the selector was restored, so run trusted reconciliation"
+            )
+        if CLAIM_LABEL in lifecycle.label_names(settled):
+            raise RuntimeError(
+                f"closed issue #{number} still has {CLAIM_LABEL}; remove it and {recovery}"
+            )
+
+        if manage_project:
+            set_project_status(str(settled["url"]), fallback_status, manifest)
+            verify_project_status(
+                str(settled["url"]),
+                fallback_status,
+                manifest,
+                recovery=recovery,
+            )
+        final = issue_state(repository, number)
+        records = verify_released_claims(
+            final, expected_releases, recovery=recovery,
+        )
+        live = [pair for pair in records if lifecycle.claim_pair_active(pair)]
+        if live or final.get("state") != "CLOSED":
+            if live and final.get("state") == "OPEN" and restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                fallback_status,
+                expected_releases,
+                recovery=recovery,
+                manage_project=manage_project,
+            ):
+                return final, True
+            add_label(repository, number, CLAIM_LABEL)
+            raise RuntimeError(
+                f"issue #{number} changed after closed-issue settlement; the selector "
+                "was restored, so run trusted reconciliation"
+            )
+        return final, False
+    raise RuntimeError(
+        f"issue #{number} closed-issue state kept changing; {recovery}"
+    )
+
+
+def settle_release_label_state(
+    repository: str,
+    number: str,
+    linked: list[dict[str, Any]],
+    *,
+    blocked: bool,
+    manifest: dict[str, Any] | None,
+    manage_project: bool,
+    fallback_status: str,
+    expected_releases: dict[str, tuple[Any, ...]],
+    recovery: str,
+) -> tuple[dict[str, Any], bool]:
+    """Reach released labels, or restore a live replacement claim."""
+    for _attempt in range(3):
+        issue = issue_state(repository, number)
+        live = [
+            pair for pair in verify_released_claims(
+                issue, expected_releases, recovery=recovery,
+            )
+            if lifecycle.claim_pair_active(pair)
+        ]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} has overlapping active claims; run "
+                "`hv-agent reconcile ISSUE --apply` before retrying"
+            )
+        if live:
+            if restore_live_claim_state(
+                repository, number, linked, manifest or {}, fallback_status,
+                expected_releases, recovery=recovery,
+                manage_project=manage_project,
+            ):
+                return issue, True
+            continue
+        remove_label(repository, number, CLAIM_LABEL)
+        (add_label if blocked else remove_label)(
+            repository, number, BLOCKED_LABEL,
+        )
+        for pr in linked:
+            pr_number = str(pr["number"])
+            (add_label if blocked else remove_label)(
+                repository, pr_number, BLOCKED_LABEL,
+            )
+            if pr.get("isDraft"):
+                mark_pull_request_ready(repository, pr)
+                pr["isDraft"] = False
+        issue = verify_lifecycle_labels(
+            repository,
+            number,
+            linked,
+            claim_present=False,
+            blocked=blocked,
+            recovery="rerun this same release command and mode",
+        )
+        live = [
+            pair for pair in verify_released_claims(
+                issue, expected_releases, recovery=recovery,
+            )
+            if lifecycle.claim_pair_active(pair)
+        ]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} has overlapping active claims; run "
+                "`hv-agent reconcile ISSUE --apply` before retrying"
+            )
+        if live:
+            if restore_live_claim_state(
+                repository, number, linked, manifest or {}, fallback_status,
+                expected_releases, recovery=recovery,
+                manage_project=manage_project,
+            ):
+                return issue, True
+            continue
+        return issue, False
+    raise RuntimeError(
+        f"issue #{number} claim state kept changing; rerun this same release command and mode"
+    )
+
+
+def settle_reconcile_label_state(
+    repository: str,
+    number: str,
+    linked: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    *,
+    remove_selector: bool,
+    expected_releases: dict[str, tuple[Any, ...]],
+) -> tuple[dict[str, Any], bool]:
+    """Verify blocked handoff labels before removing reconciliation's selector."""
+    recovery = "rerun `hv-agent reconcile ISSUE --apply`"
+    for _attempt in range(3):
+        issue = issue_state(repository, number)
+        if issue.get("state") != "OPEN":
+            raise RuntimeError(
+                f"issue #{number} closed during open-issue reconciliation; {recovery} "
+                "to settle closure as race-lost"
+            )
+        live = [
+            pair for pair in verify_released_claims(
+                issue, expected_releases, recovery=recovery,
+            )
+            if lifecycle.claim_pair_active(pair)
+        ]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} still has overlapping active claims; {recovery} "
+                "to settle deterministic losers"
+            )
+        if live:
+            if restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                "Review" if linked else "Ready",
+                expected_releases,
+                recovery=recovery,
+            ):
+                return issue, True
+            continue
+        # Retain the selector until every blocked handoff label is observable,
+        # so an interrupted run remains discoverable by the next reconcile.
+        add_label(repository, number, CLAIM_LABEL)
+        (add_label if linked else remove_label)(
+            repository, number, BLOCKED_LABEL,
+        )
+        for pr in linked:
+            add_label(repository, str(pr["number"]), BLOCKED_LABEL)
+            if pr.get("isDraft"):
+                mark_pull_request_ready(repository, pr)
+                pr["isDraft"] = False
+        prepared = verify_lifecycle_labels(
+            repository,
+            number,
+            linked,
+            claim_present=True,
+            blocked=bool(linked),
+            recovery=recovery,
+        )
+        if prepared.get("state") != "OPEN":
+            raise RuntimeError(
+                f"issue #{number} closed while reconciliation labels were prepared; "
+                f"{recovery} to settle closure as race-lost"
+            )
+        live = [
+            pair for pair in verify_released_claims(
+                prepared, expected_releases, recovery=recovery,
+            )
+            if lifecycle.claim_pair_active(pair)
+        ]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} still has overlapping active claims; {recovery} "
+                "to settle deterministic losers"
+            )
+        if live:
+            if restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                "Review" if linked else "Ready",
+                expected_releases,
+                recovery=recovery,
+            ):
+                return prepared, True
+            continue
+        if not remove_selector:
+            return prepared, False
+        remove_label(repository, number, CLAIM_LABEL)
+        try:
+            settled = verify_lifecycle_labels(
+                repository,
+                number,
+                linked,
+                claim_present=False,
+                blocked=bool(linked),
+                recovery=recovery,
+            )
+        except RuntimeError:
+            add_label(repository, number, CLAIM_LABEL)
+            raise
+        if settled.get("state") != "OPEN":
+            add_label(repository, number, CLAIM_LABEL)
+            raise RuntimeError(
+                f"issue #{number} closed while reconciliation removed its selector; "
+                f"the selector was restored, so {recovery} to settle closure as race-lost"
+            )
+        live = [
+            pair for pair in verify_released_claims(
+                settled, expected_releases, recovery=recovery,
+            )
+            if lifecycle.claim_pair_active(pair)
+        ]
+        if len(live) > 1:
+            raise RuntimeError(
+                f"issue #{number} still has overlapping active claims; {recovery} "
+                "to settle deterministic losers"
+            )
+        if live:
+            if settled.get("authorityMetadataComplete") \
+                    and CLAIM_LABEL not in lifecycle.label_names(settled):
+                # Preserve discovery under a new empty generation without
+                # treating the claim that raced selector removal as current.
+                add_label(repository, number, CLAIM_LABEL)
+                recovery_issue = issue_state(repository, number)
+                recovery_records = verify_released_claims(
+                    recovery_issue,
+                    expected_releases,
+                    recovery=f"{recovery} after selector recovery",
+                )
+                if recovery_issue.get("state") != "OPEN" \
+                        or CLAIM_LABEL not in lifecycle.label_names(recovery_issue) \
+                        or any(
+                            lifecycle.claim_pair_active(pair)
+                            for pair in recovery_records
+                        ):
+                    raise RuntimeError(
+                        f"issue #{number} live claim lost its selector during "
+                        "reconciliation and a safe recovery generation could not be "
+                        "confirmed; preserve history and inspect GitHub before retrying"
+                    )
+                raise RuntimeError(
+                    f"issue #{number} live claim raced selector removal and was "
+                    f"superseded by a fresh recovery generation; {recovery} to mark "
+                    "the lost cycle race-lost"
+                )
+            if restore_live_claim_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                "Review" if linked else "Ready",
+                expected_releases,
+                recovery=recovery,
+            ):
+                return settled, True
+            continue
+        return settled, False
+    raise RuntimeError(
+        f"issue #{number} claim state kept changing; rerun `hv-agent reconcile ISSUE --apply`"
+    )
+
+
+def release_issue(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "no_project", False)):
+        if not getattr(args, "repo", None):
+            raise RuntimeError("release --no-project requires --repo OWNER/REPO")
+        require_no_project_repository(Path(args.repo_path).resolve(), args.repo)
+        manifest = None
+        repository = args.repo
+    else:
+        manifest = load(Path(args.repo_path).resolve() / ".agents" / "project.yaml")
+        lifecycle.require_github_tracker(manifest, "release")
+        repository = manifest["tracker"]["repository"]
+    number = str(args.issue)
+    comment, payload = own_claim(
+        repository,
+        number,
+        args.session,
+        getattr(args, "claim_comment_id", None),
+    )
+    reason = "abandoned" if args.abandon else "blocked" if args.blocked else "review"
+    was_released = bool(payload.get("released_at"))
+    existing_reason = payload.get("release_reason") if payload.get("released_at") else None
+    closed_issue = issue_state(repository, number)
+    close_lost = closed_issue.get("state") != "OPEN" and (
+        not was_released or existing_reason == "race-lost"
+    )
+    if close_lost:
+        if not was_released:
+            require_claim_actor(payload, "release")
+        invalidate_closed_claim_cycle(
+            repository,
+            number,
+            str(closed_issue["url"]),
+            str(comment["id"]),
+            args,
+            manifest,
+            raise_after=False,
+        )
+        return 0
+    if existing_reason and existing_reason != reason:
+        raise RuntimeError(f"claim was already released as {existing_reason}, not {reason}")
+    provided_message = args.message.strip() if isinstance(args.message, str) else None
+    if args.message is not None and not provided_message:
+        raise RuntimeError("release --message must contain non-whitespace text")
+    stored_message = payload.get("release_message")
+    if provided_message and stored_message and provided_message != stored_message:
+        raise RuntimeError(
+            "release --message differs from the canonical claim release_message; "
+            f"reuse that exact text with --claim-comment-id {comment['id']}"
+        )
+    message = provided_message or stored_message
+    if not message:
+        if args.blocked:
+            raise RuntimeError(
+                "--blocked requires a concrete --message; rerun this exact release "
+                f"cycle with --claim-comment-id {comment['id']} --blocked "
+                '--message "BLOCKER; next: ACTION"'
+            )
+        message = f"Implementation claim released by session `{args.session}` ({reason})."
+    linked = linked_open_prs(repository, number)
+    stored_heads = payload.get("release_pr_heads")
+    if was_released and reason in lifecycle.PR_BOUND_RELEASE_REASONS \
+            and not isinstance(stored_heads, dict):
+        raise RuntimeError(
+            "released review/blocked claim lacks a canonical PR-head snapshot; "
+            "reacquire and release a new claim cycle instead of backfilling history"
+        )
+    if was_released and reason in lifecycle.PR_BOUND_RELEASE_REASONS \
+            and closed_issue.get("authorityMetadataComplete") \
+            and not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("release_evidence_sha256") or "")):
+        raise RuntimeError(
+            "released review/blocked claim lacks immutable release evidence; "
+            "reacquire and release a new claim cycle instead of backfilling history"
+        )
+    if not payload.get("released_at"):
+        if args.abandon and linked:
+            raise RuntimeError("--abandon requires no linked open pull request")
+        if not args.abandon and not linked:
+            raise RuntimeError("release to review requires a linked open pull request; use --abandon otherwise")
+    release_recovery = (
+        "rerun this same release command with --claim-comment-id "
+        f"{comment['id']}"
+    )
+    if not was_released:
+        linked = linked_open_prs(repository, number)
+        if args.abandon and linked:
+            raise RuntimeError("--abandon requires no linked open pull request")
+        if not args.abandon and not linked:
+            raise RuntimeError(
+                "release to review requires a linked open pull request; use --abandon otherwise"
+            )
+    try:
+        release_heads = (
+            stored_heads if was_released else
+            lifecycle.release_pr_heads(linked)
+            if reason in lifecycle.PR_BOUND_RELEASE_REASONS else None
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not was_released:
+        mutation_issue = issue_state(repository, number)
+        if mutation_issue.get("state") != "OPEN":
+            invalidate_closed_claim_cycle(
+                repository,
+                number,
+                str(mutation_issue["url"]),
+                str(comment["id"]),
+                args,
+                manifest,
+                raise_after=False,
+            )
+            return 0
+        mutation_records = claim_values(mutation_issue)
+        activity_error = lifecycle.release_claim_activity_error(
+            mutation_records,
+            str(comment["id"]),
+            dt.datetime.now(dt.timezone.utc),
+        )
+        if activity_error:
+            raise RuntimeError(activity_error)
+        comment, payload = next(
+            pair for pair in mutation_records
+            if str(pair[0].get("id")) == str(comment["id"])
+        )
+    expected_releases = {str(comment["id"]): (reason, message, release_heads)}
+    claim_changed = False
+    if payload.get("release_message") != message:
+        payload["release_message"] = message
+        claim_changed = True
+    if not payload.get("released_at"):
+        payload["release_reason"] = reason
+        if release_heads is not None:
+            payload["release_pr_heads"] = release_heads
+        claim_changed = True
+    closing_after_release: list[dict[str, Any]] | None = None
+    evidence_linked = linked
+    if was_released and reason in lifecycle.PR_BOUND_RELEASE_REASONS:
+        closing_after_release = linked_closing_prs(
+            repository, number, refresh=True,
+        )
+        repository_errors = lifecycle.linked_pull_request_repository_errors(
+            closing_after_release, repository,
+        )
+        if repository_errors:
+            raise RuntimeError(
+                "invalid closing pull-request relation:\n" + "\n".join(repository_errors)
+            )
+        try:
+            evidence_linked = lifecycle.release_evidence_pull_requests(
+                stored_heads, closing_after_release,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    evidence_result = ensure_release_status_evidence(
+        repository,
+        mutation_issue if not was_released else closed_issue,
+        comment,
+        payload,
+        evidence_linked,
+        create=not was_released,
+    )
+    if not payload.get("released_at"):
+        if evidence_result is not None:
+            evidence_digest, evidence_time = evidence_result
+            payload["release_evidence_sha256"] = evidence_digest
+            payload["released_at"] = evidence_time
+        else:
+            require_claim_actor(payload, "release")
+            payload["released_at"] = lifecycle.ordered_release_timestamp(
+                payload, timestamp(),
+            )
+    if not was_released:
+        intended_release = {
+            name: payload[name]
+            for name in (
+                "release_message", "release_reason", "release_pr_heads",
+                "release_evidence_sha256", "released_at",
+            )
+            if name in payload
+        }
+        mutation_issue = issue_state(repository, number)
+        if mutation_issue.get("state") != "OPEN":
+            invalidate_closed_claim_cycle(
+                repository,
+                number,
+                str(mutation_issue["url"]),
+                str(comment["id"]),
+                args,
+                manifest,
+                raise_after=False,
+            )
+            return 0
+        mutation_records = claim_values(mutation_issue)
+        activity_error = lifecycle.release_claim_activity_error(
+            mutation_records,
+            str(comment["id"]),
+            dt.datetime.now(dt.timezone.utc),
+        )
+        if activity_error:
+            raise RuntimeError(activity_error)
+        comment, payload = next(
+            pair for pair in mutation_records
+            if str(pair[0].get("id")) == str(comment["id"])
+        )
+        latest_linked = linked_open_prs(repository, number, refresh=True)
+        if args.abandon and latest_linked:
+            raise RuntimeError(
+                "a pull request became linked before canonical abandonment; rerun "
+                "release in review or blocked mode"
+            )
+        if reason in lifecycle.PR_BOUND_RELEASE_REASONS:
+            try:
+                latest_heads = lifecycle.release_pr_heads(latest_linked)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            if latest_heads != release_heads:
+                raise RuntimeError(
+                    "linked PR set or head revision changed before canonical release; "
+                    "reread GitHub and retry this unreleased cycle"
+                )
+        linked = latest_linked
+        evidence_linked = latest_linked
+        payload.update(intended_release)
+    if claim_changed:
+        update_comment(repository, comment, format_claim(payload))
+    released_issue = issue_state(repository, number)
+    released_records = verify_released_claims(
+        released_issue,
+        expected_releases,
+        recovery=release_recovery,
+    )
+    released_pair = next(
+        pair for pair in released_records
+        if str(pair[0].get("id")) == str(comment["id"])
+    )
+    ensure_release_status_evidence(
+        repository,
+        released_issue,
+        released_pair[0],
+        released_pair[1],
+        evidence_linked,
+        create=False,
+    )
+    if reason in lifecycle.PR_BOUND_RELEASE_REASONS and linked:
+        current_linked = linked_open_prs(repository, number, refresh=True)
+        try:
+            current_heads = lifecycle.release_pr_heads(current_linked)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if current_heads != release_heads:
+            raise RuntimeError(
+                "linked PR set or head revision changed after canonical release; preserve "
+                "the released snapshot, reacquire implementation, and release a new cycle"
+            )
+        linked = current_linked
+        evidence_linked = current_linked
+    merged_after_release = (
+        was_released
+        and not args.abandon
+        and not linked
+        and released_issue.get("state") == "CLOSED"
+        and any(
+            pr.get("state") == "MERGED"
+            for pr in (
+                closing_after_release
+                if closing_after_release is not None
+                else linked_closing_prs(repository, number, refresh=True)
+            )
+        )
+    )
+    target_status = (
+        str(payload.get("project_status_before_claim") or "Ready")
+        if args.abandon else "Done" if merged_after_release else "Review"
+    )
+    issue, replacement_restored = settle_release_label_state(
+        repository,
+        number,
+        linked,
+        blocked=args.blocked,
+        manifest=manifest,
+        manage_project=manifest is not None,
+        fallback_status=target_status,
+        expected_releases=expected_releases,
+        recovery=release_recovery,
+    )
+    if replacement_restored:
+        print(f"released this session's claim on {repository}#{number}; replacement claim keeps linked PRs ready")
+        return 0
+    marker = release_comment_marker(number, comment, reason)
+    if args.blocked:
+        for pr in linked:
+            pr_number = str(pr["number"])
+            comment_once(
+                repository, pr_number, marker, message, pull_request=True,
+            )
+    comment_once(repository, number, marker, message)
+    if manifest is not None:
+        set_project_status(issue["url"], target_status, manifest)
+        verify_project_status(
+            str(issue["url"]),
+            target_status,
+            manifest,
+            recovery=release_recovery,
+        )
+    for pr in linked:
+        if pr.get("isDraft"):
+            mark_pull_request_ready(repository, pr)
+            pr["isDraft"] = False
+    _final_issue, replacement_restored = settle_release_label_state(
+        repository,
+        number,
+        linked,
+        blocked=args.blocked,
+        manifest=manifest,
+        manage_project=manifest is not None,
+        fallback_status=target_status,
+        expected_releases=expected_releases,
+        recovery=release_recovery,
+    )
+    if replacement_restored:
+        print(f"released this session's claim on {repository}#{number}; replacement claim keeps linked PRs ready")
+        return 0
+    print(f"released {repository}#{number}")
+    return 0
+
+
+def labelled_issues(repository: str) -> list[dict[str, Any]]:
+    """Boundedly enumerate labelled issues through REST for background repair."""
+    values: list[dict[str, Any]] = []
+    for page in range(1, 101):
+        current = command_json([
+            "gh", "api",
+            f"repos/{repository}/issues?state=all&labels="
+            f"{quote(CLAIM_LABEL, safe='')}&per_page=100&page={page}",
+        ])
+        if not isinstance(current, list) or not all(
+            isinstance(item, dict) for item in current
+        ):
+            raise RuntimeError("background issue enumeration returned invalid state")
+        values.extend(current)
+        if len(current) < 100:
+            break
+    else:
+        raise RuntimeError(
+            "background issue enumeration reached its bounded 100-page limit"
+        )
+    return [
+        {"number": item.get("number"), "url": item.get("html_url")}
+        for item in values
+        if isinstance(item, dict) and not item.get("pull_request")
+        and item.get("number") and item.get("html_url")
+    ]
+
+
+def require_background_reconciler() -> str:
+    if os.environ.get("HV_AGENT_BACKGROUND_RECONCILER") != "1":
+        raise RuntimeError(
+            "broad reconciliation requires HV_AGENT_BACKGROUND_RECONCILER=1 and a "
+            "dedicated GitHub App installation token; use `reconcile ISSUE` for "
+            "interactive targeted repair"
+        )
+    actor = str(os.environ.get("HV_AGENT_BACKGROUND_ACTOR") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*\[bot\]", actor):
+        raise RuntimeError(
+            "broad reconciliation requires HV_AGENT_BACKGROUND_ACTOR from the "
+            "dedicated token action's app-slug output"
+        )
+    installation = command_json([
+        "gh", "api", "installation/repositories?per_page=1",
+    ])
+    if not isinstance(installation, dict) \
+            or not isinstance(installation.get("total_count"), int):
+        raise RuntimeError(
+            "broad reconciliation credential is not a GitHub App installation token"
+        )
+    bot = command_json(["gh", "api", f"users/{quote(actor, safe='')}"])
+    if not isinstance(bot, dict) or str(bot.get("login") or "") != actor \
+            or bot.get("type") != "Bot" or not bot.get("node_id"):
+        raise RuntimeError(
+            "broad reconciliation App actor could not be verified as a GitHub Bot"
+        )
+    return actor
+
+
+def reconcile_no_project_interrupted_claim(args: argparse.Namespace) -> int:
+    """Retire one selector-less no-project claim without reviving its cycle."""
+    repository = str(getattr(args, "repo", "") or "")
+    number = str(getattr(args, "issue", "") or "")
+    if not repository or not number or getattr(args, "all", False):
+        raise RuntimeError(
+            "reconcile --no-project requires exactly one ISSUE and --repo OWNER/REPO"
+        )
+    repo = Path(args.repo_path).resolve()
+    require_no_project_repository(repo, repository)
+    apply = bool(args.apply)
+
+    issue = issue_state(repository, number)
+    require_open_claim_issue(issue, number, "reconcile")
+    if not issue.get("authorityMetadataComplete"):
+        raise RuntimeError(
+            f"issue #{number} lacks complete server claim-generation authority; "
+            "do not recover a no-project claim"
+        )
+    if linked_open_prs(repository, number, refresh=True):
+        raise RuntimeError(
+            f"issue #{number} has an open linked PR; no-project recovery only retires "
+            "the pre-work interrupted-claim shape"
+        )
+    claims = claim_values(issue)
+    selector_present = CLAIM_LABEL in lifecycle.label_names(issue)
+    unreleased = [pair for pair in claims if not pair[1].get("released_at")]
+
+    if not selector_present and not unreleased:
+        if apply:
+            marker = reconcile_comment_marker(number, claims)
+            comment_once(
+                repository,
+                number,
+                marker,
+                "The interrupted no-project claim settlement was already retired. "
+                "Reacquire implementation before making changes.",
+            )
+        print(f"no-project claim recovery already settled for {repository}#{number}")
+        return 0
+
+    if selector_present and not unreleased:
+        if any(lifecycle.claim_pair_active(pair) for pair in claims):
+            raise RuntimeError(
+                f"issue #{number} has a live selector-backed claim; no-project recovery "
+                "will not replace it"
+            )
+        if apply:
+            marker = reconcile_comment_marker(number, claims)
+            comment_once(
+                repository,
+                number,
+                marker,
+                "The interrupted no-project claim was already retired. Its authenticated "
+                "recovery selector remains for the next claim to rotate safely.",
+            )
+        print(
+            f"no-project claim recovery release already settled for "
+            f"{repository}#{number}; the next claim will rotate its selector"
+        )
+        return 0
+
+    if len(unreleased) != 1:
+        raise RuntimeError(
+            f"issue #{number} has {len(unreleased)} unreleased claim cycles; "
+            "no-project recovery refuses ambiguous history"
+        )
+    comment, payload = unreleased[0]
+    owner = require_claim_actor(payload, "retire this interrupted no-project claim")
+    generation = issue.get("claimGeneration")
+    if not isinstance(generation, dict) or not generation.get("id") \
+            or str(generation.get("actorLogin") or "") != owner \
+            or not generation.get("actorNodeId"):
+        raise RuntimeError(
+            f"issue #{number} recovery selector is not authenticated to canonical owner "
+            f"{owner}; do not rotate it"
+        )
+
+    expected_releases: dict[str, tuple[str, None]] = {
+        str(comment["id"]): ("race-lost", None),
+    }
+    if not selector_present:
+        if not lifecycle.claim_pair_current((comment, payload)):
+            raise RuntimeError(
+                f"issue #{number} selector-less claim is not the current generation; "
+                "no-project recovery refuses historical authority"
+            )
+        print(
+            f"{'reconcile' if apply else 'would reconcile'} interrupted no-project "
+            f"claim for {repository}#{number} through a fresh selector generation"
+        )
+        if not apply:
+            return 0
+
+        mutation_issue = issue_state(repository, number)
+        require_open_claim_issue(mutation_issue, number, "rotate")
+        if CLAIM_LABEL in lifecycle.label_names(mutation_issue) \
+                or not mutation_issue.get("authorityMetadataComplete") \
+                or linked_open_prs(repository, number, refresh=True):
+            raise RuntimeError(
+                f"issue #{number} changed before no-project recovery rotation; reread "
+                "the canonical claim and retry"
+            )
+        mutation_claims = claim_values(mutation_issue)
+        current = [pair for pair in mutation_claims if str(pair[0].get("id")) == str(comment["id"])]
+        if len(current) != 1 or not lifecycle.claim_pair_current(current[0]) \
+                or current[0][1].get("released_at"):
+            raise RuntimeError(
+                f"issue #{number} canonical claim changed before no-project recovery; "
+                "do not rotate its selector"
+            )
+        before_generation_id = str(mutation_issue["claimGeneration"]["id"])
+        ensure_label(repository, CLAIM_LABEL, "1d76db", "Exclusive active implementation claim")
+        add_label(repository, number, CLAIM_LABEL)
+        issue = issue_state(repository, number)
+        require_open_claim_issue(issue, number, "retire")
+        generation = issue.get("claimGeneration")
+        if CLAIM_LABEL not in lifecycle.label_names(issue) \
+                or not isinstance(generation, dict) \
+                or str(generation.get("id") or "") == before_generation_id \
+                or str(generation.get("actorLogin") or "") != owner \
+                or not generation.get("actorNodeId"):
+            raise RuntimeError(
+                f"issue #{number} fresh recovery selector did not settle for canonical "
+                "owner; leave it in place and rerun reconciliation"
+            )
+        claims = claim_values(issue)
+        selected = [pair for pair in claims if str(pair[0].get("id")) == str(comment["id"])]
+        if len(selected) != 1 or lifecycle.claim_pair_current(selected[0]) \
+                or selected[0][1].get("released_at") \
+                or any(lifecycle.claim_pair_active(pair) for pair in claims):
+            raise RuntimeError(
+                f"issue #{number} claim authority changed during no-project selector "
+                "rotation; leave the selector in place and rerun reconciliation"
+            )
+        comment, payload = selected[0]
+    else:
+        if any(lifecycle.claim_pair_active(pair) for pair in claims):
+            raise RuntimeError(
+                f"issue #{number} has a live selector-backed claim; no-project recovery "
+                "will not replace it"
+            )
+        if lifecycle.claim_pair_current((comment, payload)):
+            raise RuntimeError(
+                f"issue #{number} recovery selector still names the unreleased claim; "
+                "do not release current authority"
+            )
+        print(
+            f"{'reconcile' if apply else 'would reconcile'} interrupted no-project "
+            f"claim release for {repository}#{number}"
+        )
+        if not apply:
+            return 0
+
+    if payload.get("released_at"):
+        raise RuntimeError(
+            f"issue #{number} claim was released during no-project recovery; rerun "
+            "reconciliation to settle derived state"
+        )
+    payload["released_at"] = lifecycle.ordered_release_timestamp(payload, timestamp())
+    payload["release_reason"] = "race-lost"
+    update_comment(repository, comment, format_claim(payload))
+    confirmed = verify_released_claims(
+        issue_state(repository, number),
+        expected_releases,
+        recovery="rerun `hv-agent-policy-check reconcile ISSUE --repo OWNER/REPO --no-project --apply`",
+    )
+    if linked_open_prs(repository, number, refresh=True):
+        raise RuntimeError(
+            f"issue #{number} gained an open linked PR during no-project recovery; "
+            "leave the recovery selector in place and inspect it"
+        )
+    marker = reconcile_comment_marker(number, confirmed)
+    comment_once(
+        repository,
+        number,
+        marker,
+        "An interrupted no-project claim settlement was safely retired through "
+        "authenticated server label history. Its recovery selector remains for the next "
+        "claim to rotate safely; reacquire implementation before changes.",
+    )
+    print(f"reconciled interrupted no-project claim for {repository}#{number}")
+    return 0
+
+
+def reconcile_issues(args: argparse.Namespace) -> int:
+    """Settle stale claim authority using only public, server-verifiable state."""
+    if getattr(args, "no_project", False):
+        return reconcile_no_project_interrupted_claim(args)
+    manifest = load(Path(args.repo_path).resolve() / ".agents" / "project.yaml")
+    lifecycle.require_github_tracker(manifest, "reconcile")
+    repository = manifest["tracker"]["repository"]
+    apply = bool(args.apply)
+    issue_number = getattr(args, "issue", None)
+    all_issues = bool(getattr(args, "all", False))
+    if bool(issue_number) == all_issues:
+        raise RuntimeError("reconcile requires exactly one ISSUE or --all")
+    background_actor = None
+    if all_issues:
+        background_actor = require_background_reconciler()
+        issues = labelled_issues(str(repository))
+    else:
+        issues = [{
+            "number": str(issue_number),
+            "url": f"https://github.com/{repository}/issues/{issue_number}",
+        }]
+    if not isinstance(issues, list) or not all(
+        isinstance(issue, dict) and issue.get("number") is not None for issue in issues
+    ):
+        raise RuntimeError("claim reconciliation discovery returned invalid issue data")
+    expired = 0
+    invalidated = 0
+    for issue_ref in issues:
+        number = str(issue_ref["number"])
+        issue = issue_state(repository, number)
+        claims, orphaned_generation_id = claim_values_for_generation_rotation(issue)
+        if orphaned_generation_id:
+            print(
+                f"{'reconcile' if apply else 'would reconcile'} orphaned claim "
+                f"generation {orphaned_generation_id} for {repository}#{number}"
+            )
+            if not apply:
+                continue
+            mutation_issue = issue_state(repository, number)
+            mutation_claims, confirmed_orphaned_id = \
+                claim_values_for_generation_rotation(mutation_issue)
+            if confirmed_orphaned_id != orphaned_generation_id \
+                    or CLAIM_LABEL not in lifecycle.label_names(mutation_issue) \
+                    or any(lifecycle.claim_pair_active(pair) for pair in mutation_claims):
+                raise RuntimeError(
+                    f"issue #{number} orphaned claim generation or selector changed "
+                    "before reconciliation; reread GitHub and retry"
+                )
+            actor = background_actor or str(
+                command_json(["gh", "api", "user"]).get("login") or ""
+            )
+            if not actor:
+                raise RuntimeError(
+                    f"issue #{number} orphan recovery requires an authenticated GitHub actor"
+                )
+            generated = begin_orphan_recovery_generation(
+                repository, number, actor, orphaned_generation_id,
+            )
+            expected_orphan_releases: dict[str, tuple[str, str | None]] = {}
+            for historical_comment, historical_payload in mutation_claims:
+                if historical_payload.get("released_at"):
+                    continue
+                historical_payload["released_at"] = lifecycle.ordered_release_timestamp(
+                    historical_payload, timestamp(),
+                )
+                historical_payload["release_reason"] = "race-lost"
+                update_comment(
+                    repository, historical_comment, format_claim(historical_payload),
+                )
+                expected_orphan_releases[str(historical_comment["id"])] = (
+                    "race-lost", None,
+                )
+            generated_claims = verify_released_claims(
+                issue_state(repository, number),
+                expected_orphan_releases,
+                recovery="rerun `hv-agent reconcile ISSUE --apply` for orphan recovery",
+            ) if expected_orphan_releases else claim_values(generated)
+            linked = linked_open_prs(repository, number)
+            _prepared, replacement_restored = settle_reconcile_label_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                remove_selector=False,
+                expected_releases=expected_orphan_releases,
+            )
+            if replacement_restored:
+                print(
+                    f"replacement claim detected for {repository}#{number}; "
+                    "leaving it In Progress"
+                )
+                continue
+            marker = reconcile_comment_marker(number, generated_claims)
+            comment_once(
+                repository,
+                number,
+                marker,
+                "An interrupted claim generation was rotated through authenticated "
+                "server label history. Reacquire implementation before further changes.",
+            )
+            for pr in linked:
+                comment_once(
+                    repository,
+                    str(pr["number"]),
+                    marker,
+                    "An orphaned claim generation was reconciled. Keep this PR ready "
+                    "and reacquire implementation before further changes.",
+                    pull_request=True,
+                )
+            target_status = "Review" if linked else "Ready"
+            set_project_status(str(mutation_issue["url"]), target_status, manifest)
+            verify_project_status(
+                str(mutation_issue["url"]),
+                target_status,
+                manifest,
+                recovery="rerun `hv-agent reconcile ISSUE --apply` for orphan recovery",
+            )
+            for pr in linked:
+                if pr.get("isDraft"):
+                    mark_pull_request_ready(repository, pr)
+                    pr["isDraft"] = False
+            _settled, replacement_restored = settle_reconcile_label_state(
+                repository,
+                number,
+                linked,
+                manifest,
+                remove_selector=True,
+                expected_releases=expected_orphan_releases,
+            )
+            if replacement_restored:
+                print(
+                    f"replacement claim detected for {repository}#{number}; "
+                    "leaving it In Progress"
+                )
+                continue
+            invalidated += 1
+            continue
+        live = [pair for pair in claims if lifecycle.claim_pair_active(pair)]
+        if issue.get("state") != "OPEN":
+            print(
+                f"{'reconcile' if apply else 'would reconcile'} closed-issue claim "
+                f"state for {repository}#{number}"
+            )
+            if not apply:
+                continue
+            # The discovery read is only a selector. A reopen may have admitted
+            # a valid replacement, so require a fresh CLOSED snapshot.
+            issue = issue_state(repository, number)
+            if issue.get("state") != "CLOSED":
+                current = claim_values(issue)
+                current_live = [
+                    pair for pair in current if lifecycle.claim_pair_active(pair)
+                ]
+                if len(current_live) > 1:
+                    raise RuntimeError(
+                        f"issue #{number} reopened with overlapping active claims; run "
+                        "`hv-agent reconcile ISSUE --apply` again to settle deterministic losers"
+                    )
+                if current_live:
+                    restore_live_claim_state(
+                        repository,
+                        number,
+                        linked_open_prs(repository, number),
+                        manifest,
+                        "Review",
+                        {},
+                        recovery="rerun `hv-agent reconcile ISSUE --apply`",
+                    )
+                    print(
+                        f"replacement claim detected for {repository}#{number}; "
+                        "leaving it In Progress"
+                    )
+                else:
+                    print(
+                        f"issue {repository}#{number} reopened before invalidation; "
+                        "leaving its selector for the next reconciliation pass"
+                    )
+                continue
+            invalidated += 1
+            claims = claim_values(issue)
+            expected_releases = {
+                str(comment["id"]): ("race-lost", None)
+                for comment, payload in claims if not payload.get("released_at")
+            }
+            for comment, payload in claims:
+                if payload.get("released_at"):
+                    continue
+                payload["released_at"] = lifecycle.ordered_release_timestamp(
+                    payload, timestamp(),
+                )
+                payload["release_reason"] = "race-lost"
+                update_comment(repository, comment, format_claim(payload))
+            if expected_releases:
+                verify_released_claims(
+                    issue_state(repository, number),
+                    expected_releases,
+                    recovery="rerun `hv-agent reconcile ISSUE --apply` for the closed issue",
+                )
+            latest = max(claims, key=claim_server_key)[1] if claims else {}
+            restore = str(latest.get("project_status_before_claim") or "Review")
+            if restore == "In Progress":
+                restore = "Review"
+            _settled, replacement_restored = settle_closed_claim_state(
+                repository,
+                number,
+                linked_open_prs(repository, number),
+                manifest,
+                fallback_status=restore,
+                expected_releases=expected_releases,
+                manage_project=True,
+                recovery="rerun `hv-agent reconcile ISSUE --apply` after closed-issue cleanup",
+            )
+            if replacement_restored:
+                print(
+                    f"replacement claim detected for {repository}#{number}; "
+                    "leaving it In Progress"
+                )
+            continue
+
+        conflicts = lifecycle.open_claim_conflict_releases(
+            claims, dt.datetime.now(dt.timezone.utc),
+        )
+        if conflicts:
+            if apply:
+                mutation_issue = issue_state(repository, number)
+                if mutation_issue.get("state") != "OPEN":
+                    raise RuntimeError(
+                        f"issue #{number} closed before claim-conflict mutation; rerun "
+                        "`hv-agent reconcile ISSUE --apply` to settle every cycle as race-lost"
+                    )
+                claims = claim_values(mutation_issue)
+                conflicts = lifecycle.open_claim_conflict_releases(
+                    claims, dt.datetime.now(dt.timezone.utc),
+                )
+                if not conflicts:
+                    continue
+            reasons = sorted({reason for _comment, _payload, reason in conflicts})
+            print(
+                f"{'reconcile' if apply else 'would reconcile'} "
+                f"{'/'.join(reasons)} claim conflicts for {repository}#{number}"
+            )
+            if not apply:
+                continue
+            expected_conflicts = {
+                str(comment["id"]): (reason, None)
+                for comment, _payload, reason in conflicts
+            }
+            for comment, payload, reason in conflicts:
+                payload["released_at"] = lifecycle.ordered_release_timestamp(
+                    payload, timestamp(),
+                )
+                payload["release_reason"] = reason
+                update_comment(repository, comment, format_claim(payload))
+            reconciled = issue_state(repository, number)
+            if reconciled.get("state") != "OPEN":
+                raise RuntimeError(
+                    f"issue #{number} closed during claim-conflict mutation; rerun "
+                    "`hv-agent reconcile ISSUE --apply` to settle every remaining cycle "
+                    "as race-lost"
+                )
+            claims = verify_released_claims(
+                reconciled,
+                expected_conflicts,
+                recovery="rerun `hv-agent reconcile ISSUE --apply` for claim conflicts",
+            )
+            invalidated += 1
+            live_pairs = [
+                pair for pair in claims if lifecycle.claim_pair_active(pair)
+            ]
+            if len(live_pairs) > 1:
+                raise RuntimeError(
+                    f"issue #{number} still has overlapping active claims after "
+                    "deterministic conflict settlement; rerun `hv-agent reconcile ISSUE --apply`"
+                )
+            if live_pairs and restore_live_claim_state(
+                repository,
+                number,
+                linked_open_prs(repository, number),
+                manifest,
+                "Review",
+                expected_conflicts,
+                recovery="rerun `hv-agent reconcile ISSUE --apply` for claim conflicts",
+            ):
+                print(
+                    f"preserved earliest winning claim for {repository}#{number} "
+                    "in In Progress"
+                )
+                continue
+            live = []
+        if live:
+            continue
+
+        unreleased = [pair for pair in claims if not pair[1].get("released_at")]
+        invalidated_history = False
+        if not unreleased:
+            latest = max(claims, key=claim_server_key) if claims else None
+            latest_reason = latest[1].get("release_reason") if latest else None
+            if latest and latest_reason in {"review", "blocked", "abandoned"}:
+                print(
+                    f"{'resume' if apply else 'would resume'} {latest_reason} release "
+                    f"for {repository}#{number}"
+                )
+                if not apply:
+                    continue
+                return_code = release_issue(argparse.Namespace(
+                    repo_path=args.repo_path,
+                    issue=number,
+                    session=str(latest[1]["session"]),
+                    claim_comment_id=str(latest[0]["id"]),
+                    message=None,
+                    blocked=latest_reason == "blocked",
+                    abandon=latest_reason == "abandoned",
+                ))
+                if return_code:
+                    return return_code
+                continue
+            invalidated_history = latest_reason in {"duplicate", "race-lost"}
+        if invalidated_history:
+            invalidated += 1
+        else:
+            expired += 1
+        linked = linked_open_prs(repository, number)
+        handoff_kind = "invalidated claim history" if invalidated_history else "expired claim"
+        print(
+            f"{'reconcile' if apply else 'would reconcile'} {handoff_kind} "
+            f"{repository}#{number}"
+        )
+        if not apply:
+            continue
+        mutation_issue = issue_state(repository, number)
+        if mutation_issue.get("state") != "OPEN":
+            raise RuntimeError(
+                f"issue #{number} closed before expiry settlement; rerun "
+                "`hv-agent reconcile ISSUE --apply` to settle every cycle as race-lost"
+            )
+        claims = claim_values(mutation_issue)
+        if any(lifecycle.claim_pair_active(pair) for pair in claims):
+            raise RuntimeError(
+                f"issue #{number} gained a live claim before expiry settlement; rerun "
+                "`hv-agent reconcile ISSUE --apply` to preserve the canonical winner"
+            )
+        expected_releases = {
+            str(comment["id"]): ("expired", None)
+            for comment, payload in claims
+            if not payload.get("released_at")
+            or payload.get("release_reason") == "expired"
+        }
+        for comment, payload in claims:
+            if payload.get("released_at"):
+                continue
+            payload["released_at"] = lifecycle.ordered_release_timestamp(
+                payload, timestamp(),
+            )
+            payload["release_reason"] = "expired"
+            update_comment(repository, comment, format_claim(payload))
+        verify_released_claims(
+            issue_state(repository, number),
+            expected_releases,
+            recovery="rerun `hv-agent reconcile ISSUE --apply`",
+        )
+        _prepared, replacement_restored = settle_reconcile_label_state(
+            repository,
+            number,
+            linked,
+            manifest,
+            remove_selector=False,
+            expected_releases=expected_releases,
+        )
+        if replacement_restored:
+            print(
+                f"replacement claim detected for {repository}#{number}; "
+                "leaving it In Progress"
+            )
+            continue
+        marker = reconcile_comment_marker(number, claims)
+        issue_message = (
+            "A later duplicate/race-lost claim cycle invalidates earlier review authority. "
+            "Reacquire implementation, verify the current revision, and release a new cycle."
+            if invalidated_history else
+            "Implementation lease expired. Claim released for handoff."
+        )
+        comment_once(repository, number, marker, issue_message)
+        for pr in linked:
+            pr_message = (
+                "Claim race history invalidates earlier merge authority. Reacquire, verify "
+                "the current revision, and release a new cycle; keep this PR ready."
+                if invalidated_history else
+                "Implementation lease expired. PR is ready for review but blocked pending handoff."
+            )
+            comment_once(
+                repository,
+                str(pr["number"]),
+                marker,
+                pr_message,
+                pull_request=True,
+            )
+        set_project_status(
+            str(mutation_issue["url"]), "Review" if linked else "Ready", manifest,
+        )
+        verify_project_status(
+            str(mutation_issue["url"]),
+            "Review" if linked else "Ready",
+            manifest,
+            recovery="rerun `hv-agent reconcile ISSUE --apply`",
+        )
+        for pr in linked:
+            if pr.get("isDraft"):
+                mark_pull_request_ready(repository, pr)
+                pr["isDraft"] = False
+        _settled, replacement_restored = settle_reconcile_label_state(
+            repository,
+            number,
+            linked,
+            manifest,
+            remove_selector=True,
+            expected_releases=expected_releases,
+        )
+        if replacement_restored:
+            print(
+                f"replacement claim detected for {repository}#{number}; "
+                "linked PRs remain ready"
+            )
+    print(f"expired claims: {expired}")
+    print(f"invalidated claim histories: {invalidated}")
+    completed = reconcile_project_done(manifest, apply) if all_issues else 0
+    print(f"completed project items: {completed}")
+    return 0
+
+
+def artifact_root() -> Path:
+    script = Path(__file__).resolve()
+    candidate = script.parents[1]
+    if (candidate / "policy" / "agent-development-kernel.md").exists():
+        return candidate
+    return script.parents[1]
+
+
+def expected_lifecycle_workflow(manifest: dict[str, Any]) -> bytes:
+    runtime = manifest.get("runtime", {})
+    runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) if isinstance(runtime, dict) else ""
+    if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
+        raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    runtime_stage = runtime.get("agent_lifecycle_stage", "compatibility") \
+        if isinstance(runtime, dict) else ""
+    if runtime_stage not in {"compatibility", "diagnostic"}:
+        raise ValueError(
+            "runtime.agent_lifecycle_stage must be compatibility or diagnostic"
+        )
+    name = (
+        "agent-policy-compatibility.yml"
+        if runtime_stage == "compatibility" else "agent-policy.yml"
+    )
+    template = (
+        artifact_root() / "templates" / "github" / name
+    ).read_text(encoding="utf-8")
+    needle = f"    runs-on: {DEFAULT_AGENT_POLICY_RUNNER}\n"
+    if template.count(needle) != 1:
+        raise ValueError("canonical lifecycle workflow must contain exactly one default runner")
+    return template.replace(needle, f"    runs-on: {runner}\n", 1).encode()
+
+
+def expected_previous_compatibility_lifecycle_workflow(
+    manifest: dict[str, Any],
+) -> bytes:
+    runtime = manifest.get("runtime", {})
+    runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) \
+        if isinstance(runtime, dict) else ""
+    if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
+        raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    template = (
+        artifact_root() / "templates" / "github"
+        / "agent-policy-compatibility-v1.0.9.yml"
+    ).read_text(encoding="utf-8")
+    needle = f"    runs-on: {DEFAULT_AGENT_POLICY_RUNNER}\n"
+    if template.count(needle) != 1:
+        raise ValueError(
+            "previous compatibility workflow must contain exactly one default runner"
+        )
+    return template.replace(needle, f"    runs-on: {runner}\n", 1).encode()
+
+
+def expected_runtime_only_predecessor_lifecycle_workflow(
+    manifest: dict[str, Any],
+) -> bytes:
+    """Return the exact generation-26 workflow accepted for a runtime-only cut."""
+    runtime = manifest.get("runtime", {})
+    runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) \
+        if isinstance(runtime, dict) else ""
+    if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
+        raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    template = (
+        artifact_root() / "templates" / "github" / "agent-policy-compatibility.yml"
+    ).read_text(encoding="utf-8")
+    predecessor_line = '              "rollout": manifest.get("rollout"),\n'
+    if template.count(predecessor_line) != 1:
+        raise ValueError(
+            "runtime-only predecessor workflow must contain exactly one rollout comparison"
+        )
+    template = template.replace(predecessor_line, "", 1)
+    needle = f"    runs-on: {DEFAULT_AGENT_POLICY_RUNNER}\n"
+    if template.count(needle) != 1:
+        raise ValueError(
+            "runtime-only predecessor workflow must contain exactly one default runner"
+        )
+    return template.replace(needle, f"    runs-on: {runner}\n", 1).encode()
+
+
+def artifact_is_runtime_only_rollout() -> bool:
+    """Whether this verified policy artifact permits its finite predecessor shape."""
+    try:
+        artifact = load(artifact_root() / "policy-artifact.json")
+    except (OSError, ValueError):
+        return False
+    return artifact.get("rollout") == {
+        "kind": "runtime-only", "consumer_migration_repository_ids": [],
+    }
+
+
+def expected_generation6_lifecycle_workflow(manifest: dict[str, Any]) -> bytes:
+    runtime = manifest.get("runtime", {})
+    runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) \
+        if isinstance(runtime, dict) else ""
+    if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
+        raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    template = (
+        artifact_root() / "templates" / "github" / "agent-policy-generation6.yml"
+    ).read_text(encoding="utf-8")
+    needle = f"    runs-on: {DEFAULT_AGENT_POLICY_RUNNER}\n"
+    if template.count(needle) != 1:
+        raise ValueError(
+            "generation-6 lifecycle workflow must contain exactly one default runner"
+        )
+    return template.replace(needle, f"    runs-on: {runner}\n", 1).encode()
+
+
+def expected_authority_workflow() -> bytes:
+    """Return the fixed workflow permitted in the public authority repository."""
+    template = (
+        artifact_root() / "templates" / "github" / "agent-policy-authority.yml"
+    ).read_text(encoding="utf-8")
+    needle = (
+        "    runs-on: "
+        "${{ format('arc-{0}', github.repository_owner) }}\n"
+    )
+    if template.count(needle) != 1:
+        raise ValueError(
+            "canonical lifecycle authority must contain exactly one "
+            "repository-owner organization alias"
+        )
+    return template.encode()
+
+
+def expected_generation6_authority_workflow() -> bytes:
+    """Return the exact predecessor accepted only for generation-7 bootstrap."""
+    return (
+        artifact_root() / "templates" / "github"
+        / "agent-policy-authority-generation6.yml"
+    ).read_bytes()
+
+
+def expected_policy_channel_selector() -> bytes:
+    return (artifact_root() / POLICY_CHANNEL_SELECTOR_PATH).read_bytes()
+
+
+def expected_policy_channel_rollout_workflow() -> bytes:
+    return (
+        artifact_root() / "templates" / "github" / "agent-policy-rollout.yml"
+    ).read_bytes()
+
+
+def policy_lock_errors(value: Any, label: str = "policy lock") -> list[str]:
+    fields = {
+        "schema", "artifact", "generation", "policy_revision",
+        "source_commit", "source_tree_sha256",
+    }
+    if not isinstance(value, dict):
+        return [f"{label} must be an object"]
+    errors: list[str] = []
+    if set(value) not in (fields, fields | {"rollout"}):
+        errors.append(f"{label} has unexpected or missing fields")
+    if value.get("schema") != "hv-agent-policy-lock:v1":
+        errors.append(f"{label} has an unsupported schema")
+    artifact = value.get("artifact")
+    if not isinstance(artifact, str) or not re.fullmatch(
+        r"ghcr\.io/happyvertical/agent-policy@sha256:[0-9a-f]{64}", artifact,
+    ):
+        errors.append(f"{label} artifact must be the immutable HappyVertical policy digest")
+    generation = value.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        errors.append(f"{label} generation must be a positive integer")
+    elif generation >= ROLLOUT_METADATA_GENERATION and "rollout" not in value:
+        errors.append(
+            f"{label} generation {generation} must declare explicit rollout metadata"
+        )
+    revision = value.get("policy_revision")
+    if not isinstance(revision, str) or not revision:
+        errors.append(f"{label} policy_revision must be a non-empty string")
+    commit = value.get("source_commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        errors.append(f"{label} source_commit must be a lowercase 40-character Git OID")
+    tree = value.get("source_tree_sha256")
+    if not isinstance(tree, str) or not re.fullmatch(r"[0-9a-f]{64}", tree):
+        errors.append(f"{label} source_tree_sha256 must be a lowercase SHA-256")
+    if "rollout" in value:
+        errors.extend(policy_channels.rollout_metadata_errors(
+            value["rollout"], f"{label} rollout",
+        ))
+    return errors
+
+
+def authority_substrate_predecessor(
+    generation: Any, selected_stable: Any, bind: bool = True,
+) -> tuple[dict[str, str], list[str]]:
+    """Return the predecessor substrate digests this runtime also accepts."""
+    path = artifact_root() / AUTHORITY_SUBSTRATE_PREDECESSOR_PATH
+    if not path.is_file():
+        return {}, []
+    try:
+        pin = load(path)
+        current = {
+            relative.as_posix():
+                hashlib.sha256((artifact_root() / relative).read_bytes()).hexdigest()
+            for relative in AUTHORITY_SUBSTRATE_SOURCE_PATHS
+        }
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {}, [f"{path}: {exc}"]
+    return lifecycle.bound_authority_substrate_predecessor_components(
+        pin, generation, current, selected_stable, str(path), bind,
+    )
+
+
+def authority_repository_errors(repo: Path) -> list[str]:
+    """Bind the authority repository candidate lock to this signed runtime."""
+    errors: list[str] = []
+    workflow = repo / LEGACY_WORKFLOW_PATH
+    lock_path = repo / AUTHORITY_LOCK_PATH
+    channels_path = repo / AUTHORITY_CHANNELS_PATH
+    try:
+        lock = load(lock_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return [str(exc)]
+    lock_errors = policy_lock_errors(lock, str(lock_path))
+    errors.extend(lock_errors)
+    if lock_errors:
+        return errors
+    legacy_bootstrap = not channels_path.exists()
+    if legacy_bootstrap and lock.get("generation") != 7:
+        errors.append(
+            f"{channels_path}: may be absent only while stable generation 7 bootstraps "
+            "the central channel authority"
+        )
+    if legacy_bootstrap and os.environ.get("GITHUB_ACTIONS") == "true":
+        protected = command([
+            "gh", "api",
+            "repos/happyvertical/.github/contents/.github/agent-policy-channels.json?ref=main",
+        ], check=False)
+        if protected.returncode == 0:
+            errors.append(
+                f"{channels_path}: central policy channels cannot be removed after bootstrap"
+            )
+        elif "HTTP 404" not in (protected.stderr + protected.stdout):
+            errors.append(
+                f"{channels_path}: cannot verify whether protected bootstrap state exists"
+            )
+    # The authoritative manifest load below reports its own failure; the
+    # generation is read early here only to bind the predecessor pin.
+    try:
+        generation = load(artifact_root() / "policy-artifact.json").get("generation")
+    except (OSError, ValueError, json.JSONDecodeError):
+        generation = None
+    if legacy_bootstrap:
+        # The generation-7 bootstrap has no channels to record an outgoing
+        # stable, so it keeps binding to the lock exactly as before.
+        selected_stable_lock, bind_selected_stable = lock, True
+    else:
+        try:
+            pin_channel_state: Any = load(channels_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pin_channel_state = None
+        selected_stable_lock, bind_selected_stable = lifecycle.selected_stable_binding(
+            lock, pin_channel_state, generation,
+        )
+    predecessor, predecessor_errors = authority_substrate_predecessor(
+        generation, selected_stable_lock, bind_selected_stable,
+    )
+    errors.extend(predecessor_errors)
+
+    def substrate_error(source: Path, installed: Path, expected: bytes, drift: str) -> str | None:
+        try:
+            content = installed.read_bytes()
+        except OSError as exc:
+            return str(exc)
+        if lifecycle.authority_substrate_matches(
+            content, expected, predecessor.get(source.as_posix()),
+        ):
+            return None
+        return f"{installed}: {drift}"
+
+    selector = repo / POLICY_CHANNEL_SELECTOR_PATH
+    try:
+        if legacy_bootstrap:
+            if workflow.read_bytes() != expected_generation6_authority_workflow():
+                errors.append(
+                    f"{workflow}: missing or differs from the canonical "
+                    "generation-6 bootstrap workflow"
+                )
+        else:
+            error = substrate_error(
+                POLICY_CHANNEL_AUTHORITY_WORKFLOW_TEMPLATE, workflow,
+                expected_authority_workflow(),
+                "missing or differs from the canonical source-owned authority workflow",
+            )
+            if error:
+                errors.append(error)
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+    if not legacy_bootstrap:
+        try:
+            error = substrate_error(
+                POLICY_CHANNEL_SELECTOR_PATH, selector, expected_policy_channel_selector(),
+                "missing or differs from canonical bootstrap selector",
+            )
+            if error:
+                errors.append(error)
+        except OSError as exc:
+            errors.append(str(exc))
+        rollout_workflow = repo / POLICY_CHANNEL_ROLLOUT_WORKFLOW_PATH
+        try:
+            error = substrate_error(
+                POLICY_CHANNEL_ROLLOUT_WORKFLOW_TEMPLATE, rollout_workflow,
+                expected_policy_channel_rollout_workflow(),
+                "missing or differs from the canonical protected channel rollout workflow",
+            )
+            if error:
+                errors.append(error)
+        except OSError as exc:
+            errors.append(str(exc))
+        for relative in POLICY_CHANNEL_AUTHORITY_TOOL_PATHS:
+            installed = repo / relative
+            try:
+                error = substrate_error(
+                    relative, installed, (artifact_root() / relative).read_bytes(),
+                    "missing or differs from canonical channel rollout tooling",
+                )
+                if error:
+                    errors.append(error)
+            except OSError as exc:
+                errors.append(str(exc))
+    workflow_root = repo / ".github" / "workflows"
+    if workflow_root.is_dir():
+        for candidate in sorted(workflow_root.iterdir()):
+            if candidate.suffix not in {".yml", ".yaml"} or candidate == workflow:
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8")
+            except OSError as exc:
+                errors.append(str(exc))
+                continue
+            errors.extend(
+                f"{candidate}: {error}"
+                for error in lifecycle.validation_workflow_check_context_errors(
+                    text, require_jobs=False,
+                )
+            )
+    if legacy_bootstrap:
+        selected_channel, selected_lock = "stable", lock
+    else:
+        try:
+            channel_state = load(channels_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+            return errors
+        channel_errors = policy_channels.channel_state_errors(
+            channel_state, str(channels_path),
+        )
+        errors.extend(channel_errors)
+        if channel_errors:
+            return errors
+        if channel_state["channels"]["stable"] != lock:
+            errors.append(f"{channels_path}: stable channel differs from {lock_path}")
+            return errors
+        try:
+            selected_channel, selected_lock = policy_channels.select_lock(
+                channel_state, AUTHORITY_REPOSITORY_NODE_ID,
+            )
+        except policy_channels.PolicyChannelError as exc:
+            errors.append(f"{channels_path}: cannot select authority channel: {exc}")
+            return errors
+    manifest_path = artifact_root() / "policy-artifact.json"
+    try:
+        artifact = load(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"signed runtime lacks a valid artifact manifest: {exc}")
+        return errors
+    expected_artifact = os.environ.get("POLICY_ARTIFACT") or os.environ.get("HV_POLICY_ARTIFACT")
+    if not expected_artifact:
+        errors.append("authority audit requires the selected signed POLICY_ARTIFACT identity")
+    elif selected_lock.get("artifact") != expected_artifact:
+        errors.append(
+            f"{channels_path}: selected {selected_channel} artifact does not match "
+            "the signed policy runtime"
+        )
+    for field in [
+        "generation", "policy_revision", "source_commit", "source_tree_sha256", "rollout",
+    ]:
+        if selected_lock.get(field) != artifact.get(field):
+            errors.append(
+                f"{channels_path}: selected {selected_channel} {field} does not match "
+                "the signed artifact manifest"
+            )
+    if artifact.get("source_dirty") is not False:
+        errors.append("selected signed artifact manifest records dirty source")
+    return errors
+
+
+def agent_policy_workflow(manifest: dict[str, Any]) -> str | None:
+    """Return the deprecated folded workflow selector, if still configured."""
+    runtime = manifest.get("runtime", {})
+    value = runtime.get("agent_policy_workflow") if isinstance(runtime, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, str) or not AGENT_POLICY_WORKFLOW_PATTERN.fullmatch(value):
+        raise ValueError("runtime.agent_policy_workflow must be a repository workflow path")
+    return value
+
+
+def agent_validation_workflow(manifest: dict[str, Any]) -> str | None:
+    runtime = manifest.get("runtime", {})
+    value = runtime.get("agent_validation_workflow") if isinstance(runtime, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, str) or not AGENT_POLICY_WORKFLOW_PATTERN.fullmatch(value):
+        raise ValueError("runtime.agent_validation_workflow must be a repository workflow path")
+    if Path(value) == LEGACY_WORKFLOW_PATH:
+        raise ValueError(
+            "runtime.agent_validation_workflow must differ from the dedicated "
+            f"lifecycle workflow {LEGACY_WORKFLOW_PATH}"
+        )
+    return value
+
+
+def expected_validation_lifecycle_dependency(manifest: dict[str, Any]) -> str:
+    runtime = manifest.get("runtime", {})
+    runner = runtime.get("agent_policy_runner", DEFAULT_AGENT_POLICY_RUNNER) if isinstance(runtime, dict) else ""
+    if not isinstance(runner, str) or not AGENT_POLICY_RUNNER_PATTERN.fullmatch(runner):
+        raise ValueError("runtime.agent_policy_runner must be a literal GitHub runner label")
+    template = (
+        artifact_root() / "templates" / "github"
+        / "agent-validation-lifecycle-dependency.yml"
+    ).read_text(encoding="utf-8")
+    needle = f"    runs-on: {DEFAULT_AGENT_POLICY_RUNNER}\n"
+    if template.count(needle) != 1:
+        raise ValueError("validation lifecycle dependency must contain one default runner")
+    return template.replace(needle, f"    runs-on: {runner}\n", 1)
+
+
+def audit_repository(repo: Path) -> list[str]:
+    errors: list[str] = []
+    manifest_path = repo / ".agents" / "project.yaml"
+    agents_path = repo / "AGENTS.md"
+    manifest: dict[str, Any] = {}
+    try:
+        manifest = load(manifest_path)
+        if manifest.get("schema") != "https://happyvertical.com/schemas/agent-project/v1":
+            errors.append(f"{manifest_path}: unsupported schema")
+        if manifest.get("policy", {}).get("revision") != POLICY_REVISION:
+            errors.append(f"{manifest_path}: stale policy revision")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(str(exc))
+    try:
+        guidance = agents_path.read_text(encoding="utf-8")
+        if len(guidance.encode()) > ROOT_GUIDANCE_MAX:
+            errors.append(f"{agents_path}: exceeds {ROOT_GUIDANCE_MAX} bytes")
+        kernel = (artifact_root() / "policy" / "agent-development-kernel.md").read_bytes()
+        expected_hash = hashlib.sha256(kernel).hexdigest()
+        block = re.search(r"<!-- hv-managed-policy:start.*?<!-- hv-managed-policy:end -->", guidance, re.S)
+        # A compatibility-stage repository migrated by the previous stable
+        # release keeps that release's exact generated kernel block until its
+        # pin advances; the grace is bounded to the vendored previous-release
+        # kernel and never applies at the diagnostic stage.
+        grace_block = None
+        runtime_policy = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
+        if (runtime_policy or {}).get("agent_lifecycle_stage", "compatibility") == "compatibility":
+            try:
+                compat_kernel = (
+                    artifact_root() / "policy" / "agent-development-kernel-compat-v1.0.9.md"
+                ).read_bytes()
+                compat_hash = hashlib.sha256(compat_kernel).hexdigest()
+                compat_bullets = [
+                    line for line in compat_kernel.decode().splitlines()
+                    if line.startswith("- ")
+                ]
+                grace_block = (
+                    f"<!-- hv-managed-policy:start revision={POLICY_REVISION} sha256={compat_hash} -->\n\n"
+                    "## Shared development kernel\n\n"
+                    + "\n".join(compat_bullets)
+                    + "\n\n<!-- hv-managed-policy:end -->"
+                )
+            except (OSError, UnicodeDecodeError):
+                grace_block = None
+        grace_ok = grace_block is not None and block is not None \
+            and block.group(0) == grace_block
+        marker = re.search(r"hv-managed-policy:start revision=([^ ]+) sha256=([a-f0-9]{64})", guidance)
+        if not grace_ok and (
+            not marker or marker.group(1) != POLICY_REVISION or marker.group(2) != expected_hash
+        ):
+            errors.append(f"{agents_path}: stale or edited managed policy block")
+        bullets = [line for line in kernel.decode().splitlines() if line.startswith("- ")]
+        expected_block = (
+            f"<!-- hv-managed-policy:start revision={POLICY_REVISION} sha256={expected_hash} -->\n\n"
+            "## Shared development kernel\n\n"
+            + "\n".join(bullets)
+            + "\n\n<!-- hv-managed-policy:end -->"
+        )
+        if not grace_ok and (not block or block.group(0) != expected_block):
+            errors.append(f"{agents_path}: generated policy block was edited")
+    except OSError as exc:
+        errors.append(str(exc))
+    repository_id = os.environ.get("GITHUB_REPOSITORY_ID")
+    if manifest:
+        errors.extend(formatting_rollout.audit(
+            repo,
+            artifact_root(),
+            manifest,
+            source_repository=(
+                os.environ.get("GITHUB_ACTIONS") == "true"
+                and repository_id in {
+                    CONTROL_PLANE_REPOSITORY_ID, AUTHORITY_REPOSITORY_ID,
+                }
+            ),
+        ))
+    for relative in ["CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md"]:
+        path = repo / relative
+        try:
+            if "AGENTS.md" not in path.read_text(encoding="utf-8"):
+                errors.append(f"{path}: invalid adapter")
+        except OSError as exc:
+            errors.append(str(exc))
+    # The control-plane repository has a local validation workflow. The public
+    # authority repository carries the fixed required workflow and monotonic
+    # lock. Other repositories carry only diagnostic consumer integrations.
+    if repository_id == AUTHORITY_REPOSITORY_ID:
+        errors.extend(authority_repository_errors(repo))
+    elif repository_id != CONTROL_PLANE_REPOSITORY_ID:
+        try:
+            folded = agent_policy_workflow(manifest)
+            corrective = "; run scripts/hv-agent migrate-repo . --profile happyvertical --apply"
+            if folded and Path(folded) != LEGACY_WORKFLOW_PATH:
+                errors.append(
+                    f"{repo / folded}: hazardous folded lifecycle configuration remains{corrective}"
+                )
+            workflow = repo / LEGACY_WORKFLOW_PATH
+            accepted = [
+                expected_lifecycle_workflow(manifest),
+                expected_generation6_lifecycle_workflow(manifest),
+            ]
+            runtime = manifest.get("runtime", {})
+            stage = runtime.get("agent_lifecycle_stage", "compatibility") \
+                if isinstance(runtime, dict) else ""
+            if stage == "compatibility":
+                accepted.append(
+                    expected_previous_compatibility_lifecycle_workflow(manifest)
+                )
+            if artifact_is_runtime_only_rollout():
+                accepted.append(
+                    expected_runtime_only_predecessor_lifecycle_workflow(manifest)
+                )
+            if workflow.read_bytes() not in accepted:
+                errors.append(f"{workflow}: missing or differs from the canonical lifecycle workflow")
+            validation = agent_validation_workflow(manifest)
+            required_checks = manifest.get("github", {}).get("required_status_checks", [])
+            if isinstance(required_checks, list) and required_checks and validation is None:
+                errors.append(
+                    f"{repo / '.agents/project.yaml'}: managed required checks require "
+                    "runtime.agent_validation_workflow; restore the repository's required "
+                    f"code-validation workflow selector{corrective}"
+                )
+            if validation:
+                validation_path = repo / validation
+                text = validation_path.read_text(encoding="utf-8")
+                if "# hv-agent-policy:start" in text or "# hv-agent-policy:end" in text:
+                    errors.append(
+                        f"{validation_path}: validation workflow still contains a folded "
+                        f"lifecycle block{corrective}"
+                    )
+                dependency = expected_validation_lifecycle_dependency(manifest)
+                has_dependency_marker = (
+                    "# hv-agent-validation-dependency:start" in text
+                    or "# hv-agent-validation-dependency:end" in text
+                )
+                if has_dependency_marker and not lifecycle.exact_managed_top_level_mapping_child_block(
+                    text,
+                    dependency,
+                    "# hv-agent-validation-dependency:start",
+                    "# hv-agent-validation-dependency:end",
+                    2,
+                ):
+                    errors.append(
+                        f"{validation_path}: validation lifecycle dependency differs "
+                        f"from canonical{corrective}"
+                    )
+                if lifecycle.workflow_references_lifecycle_job(text) and not has_dependency_marker:
+                    errors.append(
+                        f"{validation_path}: repository jobs depend on the isolated lifecycle "
+                        f"job without the managed validation dependency{corrective}"
+                    )
+                errors.extend(
+                    f"{validation_path}: {error}{corrective}"
+                    for error in lifecycle.validation_workflow_trigger_errors(text)
+                )
+            workflow_root = repo / ".github" / "workflows"
+            if workflow_root.is_dir():
+                for candidate in sorted(workflow_root.iterdir()):
+                    if candidate.suffix not in {".yml", ".yaml"} or candidate == workflow:
+                        continue
+                    text = candidate.read_text(encoding="utf-8")
+                    if "# hv-agent-policy:start" in text or "# hv-agent-policy:end" in text:
+                        message = f"{candidate}: untracked folded lifecycle block remains{corrective}"
+                        if message not in errors:
+                            errors.append(message)
+                    if validation is None or candidate != repo / validation:
+                        errors.extend(
+                            f"{candidate}: {error}{corrective}"
+                            for error in lifecycle.validation_workflow_check_context_errors(
+                                text, require_jobs=False,
+                            )
+                        )
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+    return errors
+
+
+def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
+    """Return this revision's rejections, and notes explaining which remedy fits."""
+    errors = audit_repository(repo)
+    notes: list[str] = []
+    manifest = load(repo / ".agents" / "project.yaml")
+    manifest_repository = lifecycle.forge_repository(manifest)
+    trusted_repository = os.environ.get("GITHUB_REPOSITORY")
+    repository = trusted_repository or manifest_repository
+    if trusted_repository and manifest_repository != trusted_repository:
+        errors.append(
+            f"tracker.repository {manifest_repository} does not match trusted workflow "
+            f"repository {trusted_repository}; restore generated project policy"
+        )
+    pr = lifecycle_pull_request(repository, number)
+    if lifecycle.validation_workflow_evidence_required(
+        os.environ.get("EVENT_NAME"), os.environ.get("EVENT_ACTION"),
+    ):
+        try:
+            workflow_path, timeline = github.validation_workflow_evidence(
+                command_json, RuntimeError, repository, pr,
+                require_selector=(
+                    os.environ.get("GITHUB_REPOSITORY_ID") == CONTROL_PLANE_REPOSITORY_ID
+                ),
+                canonical_lifecycle=expected_lifecycle_workflow,
+            )
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        else:
+            if workflow_path:
+                error = lifecycle.validation_workflow_transition_error(
+                    pr, workflow_path, timeline,
+                )
+                if error:
+                    errors.append(error)
+    links = pr.get("closingIssuesReferences", [])
+    errors.extend(lifecycle.closing_issue_reference_errors(pr, repository))
+    default_branch = pr.get("baseRepositoryDefaultBranch")
+    base_branch = pr.get("baseRefName")
+    if not isinstance(default_branch, str) or not default_branch \
+            or not isinstance(base_branch, str) or not base_branch:
+        errors.append("PR base branch metadata is unavailable; reread GitHub before lifecycle validation")
+    else:
+        check_commit_references = base_branch == default_branch
+        errors.extend(lifecycle.undeclared_closing_reference_errors(
+            pr,
+            pull_request_commits(repository, str(number)) if check_commit_references else [],
+            repository,
+            check_commit_references=check_commit_references,
+        ))
+    linked_issues = [
+        lifecycle_issue_state(repository, str(link["number"]))
+        for link in links
+        if not lifecycle.closing_issue_reference_errors(
+            {"closingIssuesReferences": [link]}, repository,
+        )
+    ]
+    needs_release_evidence = any(
+        issue.get("authorityMetadataComplete")
+        and any(
+            claim.get("released_at")
+            and claim.get("release_reason") in lifecycle.PR_BOUND_RELEASE_REASONS
+            for _comment, claim in lifecycle.claim_comment_records(issue)[0]
+        )
+        for issue in linked_issues
+    )
+    head_oid = str(pr.get("headRefOid") or "")
+    pr["commitStatuses"] = (
+        commit_statuses(repository, head_oid)
+        if needs_release_evidence and head_oid else []
+    )
+    metadata = parse_marked(pr.get("body", ""), RUN_MARKER, "hv-agent-run:v1")
+    if not metadata:
+        branch = str(pr.get("headRefName", ""))
+        claimed_issue = any(
+            records or claim_errors
+            for issue in linked_issues
+            for records, claim_errors in [lifecycle.claim_comment_records(issue)]
+        )
+        if AGENT_BRANCH_PATTERN.match(branch) or claimed_issue:
+            errors.append(
+                "agent-authored PR is missing valid hv-agent-run:v1 metadata; repair the "
+                "PR body and keep the PR ready"
+            )
+        elif BLOCKED_LABEL in lifecycle.label_names(pr):
+            errors.append(
+                "PR has status: blocked; resolve the blocker and remove the label before merge"
+            )
+        return errors, notes
+    errors.extend(
+        lifecycle.validate_agent_pr(
+            pr,
+            metadata,
+            linked_issues,
+            POLICY_REVISION,
+            merge_group=os.environ.get("EVENT_NAME") == "merge_group",
+            repository=repository,
+        )
+    )
+    if errors:
+        notes.extend(
+            note for issue in linked_issues
+            if (note := lifecycle.release_settlement_pending(issue, metadata, pr, errors))
+        )
+    return errors, notes
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command_name", required=True)
+    audit = commands.add_parser("audit")
+    audit.add_argument("repo", nargs="?", default=".")
+    check = commands.add_parser("check-pr")
+    check.add_argument("number")
+    check.add_argument("repo", nargs="?", default=".")
+    claim = commands.add_parser("claim")
+    claim.add_argument("issue", type=int)
+    claim.add_argument("--repo-path", default=".")
+    claim.add_argument("--repo")
+    claim.add_argument("--runtime", required=True)
+    claim.add_argument("--owner", required=True)
+    claim.add_argument("--session", required=True)
+    claim.add_argument("--branch")
+    claim.add_argument("--worktree")
+    claim.add_argument("--no-project", action="store_true")
+    heartbeat = commands.add_parser("heartbeat")
+    heartbeat.add_argument("issue", type=int)
+    heartbeat.add_argument("--repo-path", default=".")
+    heartbeat.add_argument("--session", required=True)
+    heartbeat.add_argument("--repair-legacy-owner")
+    heartbeat.add_argument("--branch")
+    heartbeat.add_argument("--worktree")
+    release = commands.add_parser("release")
+    release.add_argument("issue", type=int)
+    release.add_argument("--repo-path", default=".")
+    release.add_argument("--repo")
+    release.add_argument("--session", required=True)
+    release.add_argument("--claim-comment-id")
+    release.add_argument("--message")
+    release_mode = release.add_mutually_exclusive_group()
+    release_mode.add_argument("--blocked", action="store_true")
+    release_mode.add_argument("--abandon", action="store_true")
+    release.add_argument("--no-project", action="store_true")
+    reconcile = commands.add_parser("reconcile")
+    reconcile.add_argument("issue", nargs="?", type=int)
+    reconcile.add_argument("--repo-path", default=".")
+    reconcile.add_argument("--repo")
+    reconcile.add_argument("--all", action="store_true")
+    reconcile.add_argument("--apply", action="store_true")
+    reconcile.add_argument("--no-project", action="store_true")
+    project_sync = commands.add_parser("project-sync")
+    project_sync.add_argument("--repo-path", default=".")
+    project_sync.add_argument(
+        "--item", nargs=2, action="append", required=True,
+        metavar=("ISSUE_URL", "STATUS"),
+    )
+    project_sync.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    try:
+        budget_command = {
+            "claim": "claim",
+            "heartbeat": "heartbeat",
+            "release": "release",
+            "check-pr": "check-pr",
+        }.get(args.command_name)
+        if args.command_name == "reconcile":
+            budget_command = (
+                "reconcile-background"
+                if bool(getattr(args, "all", False))
+                else "reconcile-targeted"
+            )
+        if args.command_name == "project-sync":
+            args.project_requests = github.project_status_requests(args.item)
+            GRAPHQL.preflight_project_sync(len(args.project_requests))
+        if budget_command:
+            GRAPHQL.preflight(budget_command)
+        if args.command_name == "claim":
+            return claim_issue(args)
+        if args.command_name == "heartbeat":
+            return heartbeat_issue(args)
+        if args.command_name == "release":
+            return release_issue(args)
+        if args.command_name == "reconcile":
+            return reconcile_issues(args)
+        if args.command_name == "project-sync":
+            return project_sync_items(args)
+        repo = Path(args.repo).resolve()
+        errors, notes = (
+            (audit_repository(repo), [])
+            if args.command_name == "audit" else check_pr(repo, args.number)
+        )
+        for error in errors:
+            print(f"ERROR {error}")
+        for note in notes:
+            print(f"NOTE {note}")
+        for annotation in lifecycle.lifecycle_annotations(
+            errors, notes,
+            github_actions=os.environ.get("GITHUB_ACTIONS") == "true",
+        ):
+            print(annotation)
+        if errors:
+            return 1
+        print("Agent Policy / lifecycle passed")
+        return 0
+    finally:
+        summary = GRAPHQL.summary()
+        if summary:
+            print(summary, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (KeyError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        raise SystemExit(2)

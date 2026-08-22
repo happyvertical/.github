@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths: [.github/agent-policy-channels.json]
   repository_dispatch:
-    types: [agent-policy-rollout-ready]
+    types: [agent-policy-rollout-ready, agent-policy-rollout-abort]
 
 permissions:
   contents: read
@@ -132,6 +132,9 @@ jobs:
           permission-contents: write
           permission-issues: write
           permission-pull-requests: write
+          permission-actions: write
+          permission-statuses: write
+          permission-organization-projects: write
           # Abort and rollback restore the substrate of the lock they restore,
           # which includes the two authority workflow files.
           permission-workflows: write
@@ -140,14 +143,32 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TYPE: ${{ github.event.action }}
           ROLLOUT_READY: ${{ github.event.client_payload.rollout_ready }}
+          ROLLOUT_ABORT: ${{ github.event.client_payload.rollout_abort }}
           READY_REVISION: ${{ github.event.client_payload.state_revision }}
         run: |
           set -euo pipefail
           phase=$(jq -r '.promotion.phase // "none"' .github/agent-policy-channels.json)
           state_revision=$(jq -r '.revision' .github/agent-policy-channels.json)
           case "$phase" in canary|smoke|none) ;; *) exit 1 ;; esac
-          if test "$phase" != none && test "$EVENT_NAME" = push; then
+          if test "$EVENT_NAME" = repository_dispatch \
+              && test "$DISPATCH_TYPE" = agent-policy-rollout-abort; then
+            test "$phase" = canary || {
+              echo 'an explicit policy abort requires an active canary phase' >&2
+              exit 1
+            }
+            test "$ROLLOUT_ABORT" = true || {
+              echo 'rollout_abort=true is required for an explicit policy abort' >&2
+              exit 1
+            }
+            if ! [[ "$READY_REVISION" =~ ^[0-9]+$ ]] \
+                || test "$READY_REVISION" != "$state_revision"; then
+              echo "explicit abort targets revision $READY_REVISION, current state is $state_revision" >&2
+              exit 1
+            fi
+            echo "force_abort=true" >> "$GITHUB_OUTPUT"
+          elif test "$phase" != none && test "$EVENT_NAME" = push; then
             echo "policy $phase is paused for ring migration and explicit readiness confirmation"
             phase=none
           elif test "$phase" != none && test "$ROLLOUT_READY" != true; then
@@ -160,34 +181,99 @@ jobs:
             exit 1
           fi
           echo "phase=$phase" >> "$GITHUB_OUTPUT"
-      - name: Run exact default-head ring
+      - name: Detect resumable protected transition branch
+        id: resume
         if: ${{ steps.phase.outputs.phase != 'none' }}
+        env:
+          PHASE: ${{ steps.phase.outputs.phase }}
+          FORCE_ABORT: ${{ steps.phase.outputs.force_abort }}
+        run: |
+          set -euo pipefail
+          state_revision=$(jq -er '.revision | select(type == "number" and . >= 1)' \
+            .github/agent-policy-channels.json)
+          revision=$((state_revision + 1))
+          branches=$(git ls-remote --heads origin \
+            "refs/heads/agent/policy-channel-${revision}-*" | \
+            awk '{sub("refs/heads/", "", $2); print $1 " " $2}')
+          count=$(sed '/^$/d' <<<"$branches" | wc -l | tr -d ' ')
+          case "$count" in
+            0) echo 'resume=false' >> "$GITHUB_OUTPUT"; exit 0 ;;
+            1) ;;
+            *) echo 'competing generated transition branches exist for this revision' >&2; exit 1 ;;
+          esac
+          read -r head_sha branch <<<"$branches"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          case "$branch" in
+            "agent/policy-channel-${revision}-promote") action=promote ;;
+            "agent/policy-channel-${revision}-abort") action=abort ;;
+            "agent/policy-channel-${revision}-finalize") action=finalize ;;
+            "agent/policy-channel-${revision}-rollback") action=rollback ;;
+            *) echo "unexpected generated transition branch: $branch" >&2; exit 1 ;;
+          esac
+          case "$PHASE:$action" in
+            canary:promote | canary:abort | smoke:finalize | smoke:rollback) ;;
+            *) echo "existing transition $action does not match active $PHASE phase" >&2; exit 1 ;;
+          esac
+          if test "$FORCE_ABORT" = true && test "$action" != abort; then
+            echo 'explicit abort cannot resume a non-abort transition' >&2
+            exit 1
+          fi
+          {
+            echo 'resume=true'
+            echo "action=$action"
+            echo "revision=$revision"
+            echo "branch=$branch"
+            echo "head_sha=$head_sha"
+          } >> "$GITHUB_OUTPUT"
+      - name: Run exact default-head ring
+        if: ${{ steps.phase.outputs.phase != 'none' && steps.resume.outputs.resume != 'true' }}
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           PHASE: ${{ steps.phase.outputs.phase }}
+          FORCE_ABORT: ${{ steps.phase.outputs.force_abort }}
         run: |
-          scripts/hv-agent-policy-canary \
-            .github/agent-policy-channels.json "$RUNNER_TEMP/evidence.json" \
-            --phase "$PHASE" --apply
+          canary_command=(
+            scripts/hv-agent-policy-canary
+            .github/agent-policy-channels.json "$RUNNER_TEMP/evidence.json"
+            --phase "$PHASE"
+          )
+          if test "$FORCE_ABORT" = true; then
+            canary_command+=(--cancel)
+          fi
+          canary_command+=(--apply)
+          "${canary_command[@]}"
           cosign sign-blob --yes \
             --bundle "$RUNNER_TEMP/evidence.bundle" \
             "$RUNNER_TEMP/evidence.json"
       - name: Apply verified transition
-        if: ${{ steps.phase.outputs.phase != 'none' }}
+        if: ${{ steps.phase.outputs.phase != 'none' && steps.resume.outputs.resume != 'true' }}
         env:
           PHASE: ${{ steps.phase.outputs.phase }}
+          FORCE_ABORT: ${{ steps.phase.outputs.force_abort }}
         run: |
           set -euo pipefail
           state=.github/agent-policy-channels.json
           evidence="$RUNNER_TEMP/evidence.json"
           revision=$(jq -r '.revision' "$state")
-          if jq -e '(.errors | length == 0) and (.results | length > 0) and all(.results[]; .conclusion == "success")' "$evidence" >/dev/null; then
+          if test "$FORCE_ABORT" = true; then
+            test "$PHASE" = canary || {
+              echo 'only an active canary may be explicitly aborted' >&2
+              exit 1
+            }
+            action=abort
+          elif jq -e '(.errors | length == 0) and (.results | length > 0) and all(.results[]; .conclusion == "success")' "$evidence" >/dev/null; then
             action=$([ "$PHASE" = canary ] && echo promote || echo finalize)
           else
             action=$([ "$PHASE" = canary ] && echo abort || echo rollback)
           fi
-          scripts/hv-agent-policy-channels "$action" "$state" "$evidence" \
-            --expected-revision "$revision" --apply
+          transition_command=(
+            scripts/hv-agent-policy-channels "$action" "$state" "$evidence"
+          )
+          if test "$FORCE_ABORT" = true; then
+            transition_command+=(--require-cancelled-ring)
+          fi
+          transition_command+=(--expected-revision "$revision" --apply)
+          "${transition_command[@]}"
           jq '.channels.stable' "$state" > .github/agent-policy-lock.json
           next_revision=$(jq -r '.revision' "$state")
           evidence_path=".github/agent-policy-evidence/revision-${next_revision}.json"
@@ -201,10 +287,158 @@ jobs:
             echo "evidence_path=$evidence_path"
             echo "evidence_bundle_path=$evidence_bundle_path"
           } >> "$GITHUB_ENV"
+      - name: Reuse verified protected transition
+        if: ${{ steps.resume.outputs.resume == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.promoter-token.outputs.token }}
+          ACTION: ${{ steps.resume.outputs.action }}
+          REVISION: ${{ steps.resume.outputs.revision }}
+          BRANCH: ${{ steps.resume.outputs.branch }}
+          EXPECTED_HEAD_SHA: ${{ steps.resume.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse HEAD)
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          # The resumed branch may be an abort/rollback that restores an older
+          # policy runtime. Validate its transition with the protected-main
+          # parser selected by base_sha, never the branch-owned predecessor
+          # helper which cannot parse this generation's rollout metadata.
+          resume_validation_root="$RUNNER_TEMP/agent-policy-resume-validation"
+          rm -rf "$resume_validation_root"
+          mkdir -p "$resume_validation_root"
+          git archive "$base_sha" scripts/hv_agent_policy_channels.py | \
+            tar -x -C "$resume_validation_root"
+          gh auth setup-git
+          git fetch origin "$BRANCH"
+          git switch -C "$BRANCH" "origin/$BRANCH"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA" || {
+            echo 'remote generated transition branch changed while resuming' >&2
+            exit 1
+          }
+          test "$(git rev-parse HEAD^)" = "$base_sha" || {
+            echo 'generated transition branch is not based on the exact current default head' >&2
+            exit 1
+          }
+          evidence_path=".github/agent-policy-evidence/revision-${REVISION}.json"
+          evidence_bundle_path=".github/agent-policy-evidence/revision-${REVISION}.bundle"
+          tree_manifest_path=".github/agent-policy-evidence/revision-${REVISION}.tree.json"
+          tree_manifest_bundle_path=".github/agent-policy-evidence/revision-${REVISION}.tree.bundle"
+          test -f "$evidence_path" && test -f "$evidence_bundle_path" || {
+            echo 'generated transition branch is missing its persisted evidence or bundle' >&2
+            exit 1
+          }
+          test -f "$tree_manifest_path" && test -f "$tree_manifest_bundle_path" || {
+            echo 'generated transition branch is missing its signed tree manifest' >&2
+            exit 1
+          }
+          cosign verify-blob --bundle "$evidence_bundle_path" \
+            --certificate-identity 'https://github.com/happyvertical/.github/.github/workflows/agent-policy-rollout.yml@refs/heads/main' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$evidence_path"
+          cosign verify-blob --bundle "$tree_manifest_bundle_path" \
+            --certificate-identity 'https://github.com/happyvertical/.github/.github/workflows/agent-policy-rollout.yml@refs/heads/main' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$tree_manifest_path"
+          PYTHONPATH="$resume_validation_root/scripts" python3 - "$ACTION" "$REVISION" "$evidence_path" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          from hv_agent_policy_channels import transition_errors
+
+          action, revision, evidence_path = sys.argv[1:]
+          previous = json.loads(subprocess.run(
+              ["git", "show", "HEAD^:.github/agent-policy-channels.json"],
+              check=True, text=True, capture_output=True,
+          ).stdout)
+          candidate = json.loads(open(
+              ".github/agent-policy-channels.json", encoding="utf-8",
+          ).read())
+          evidence = json.loads(open(evidence_path, encoding="utf-8").read())
+          errors = transition_errors(previous, candidate, evidence)
+          transition = candidate.get("transition")
+          if (
+              not isinstance(transition, dict)
+              or transition.get("action") != action
+              or transition.get("to_revision") != int(revision)
+          ):
+              errors.append("persisted transition action or revision is not exact")
+          stable = candidate.get("channels", {}).get("stable")
+          lock = json.loads(open(
+              ".github/agent-policy-lock.json", encoding="utf-8",
+          ).read())
+          if lock != stable:
+              errors.append("persisted policy lock does not match the transition stable lock")
+          if errors:
+              raise SystemExit("invalid persisted protected transition:\n" + "\n".join(errors))
+          PY
+          python3 - "$base_sha" "$tree_manifest_path" \
+            "$tree_manifest_bundle_path" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path, PurePosixPath
+          import subprocess
+          import sys
+
+          base_sha, manifest_path, manifest_bundle_path = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+          if (
+              not isinstance(manifest, dict)
+              or set(manifest) != {"schema", "base_sha", "components"}
+              or manifest.get("schema") != "hv-agent-policy-transition-tree:v1"
+              or manifest.get("base_sha") != base_sha
+              or not isinstance(manifest.get("components"), dict)
+              or not manifest["components"]
+          ):
+              raise SystemExit("generated transition tree manifest is malformed")
+          expected = manifest["components"]
+          for path, digest in expected.items():
+              pure = PurePosixPath(path)
+              if (
+                  not isinstance(path, str)
+                  or str(pure) != path
+                  or pure.is_absolute()
+                  or ".." in pure.parts
+                  or path in {manifest_path, manifest_bundle_path}
+                  or (
+                      digest is not None
+                      and (
+                          not isinstance(digest, str)
+                          or len(digest) != 64
+                          or any(character not in "0123456789abcdef" for character in digest)
+                      )
+                  )
+              ):
+                  raise SystemExit("generated transition tree manifest has an unsafe component")
+          actual: dict[str, str] = {}
+          for line in subprocess.run(
+              ["git", "diff", "--name-status", "--no-renames", "HEAD^", "HEAD"],
+              check=True, text=True, capture_output=True,
+          ).stdout.splitlines():
+              status, path = line.split("\t", 1)
+              if status not in {"A", "M", "D"}:
+                  raise SystemExit("generated transition tree has an unsupported rename or path")
+              if path in {manifest_path, manifest_bundle_path}:
+                  continue
+              actual[path] = (
+                  hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                  if status in {"A", "M"} else None
+              )
+          if actual != expected:
+              raise SystemExit("generated transition tree differs from its producer-signed manifest")
+          PY
+          cp "$evidence_bundle_path" "$RUNNER_TEMP/evidence.bundle"
+          {
+            echo "action=$ACTION"
+            echo "revision=$REVISION"
+            echo "evidence_path=$evidence_path"
+            echo "evidence_bundle_path=$evidence_bundle_path"
+          } >> "$GITHUB_ENV"
       - name: Reconcile substrate with the resulting stable generation
         if: ${{ steps.phase.outputs.phase != 'none' }}
         env:
           POLICY_PUBLISHER_IDENTITY: ${{ vars.AGENT_POLICY_PUBLISHER_IDENTITY }}
+          RESUME: ${{ steps.resume.outputs.resume }}
         run: |
           set -euo pipefail
           # A candidate that changed authority substrate is migrated into this
@@ -213,6 +447,32 @@ jobs:
           # restore; promote and finalize copy identical bytes and change
           # nothing. Without this the restored generation would face substrate
           # it cannot recognize and its own required check would fail closed.
+          # The transition branch is allowed to restore an older substrate, but
+          # its claim is always produced by this trusted workflow revision. Save
+          # that complete producer runtime before the restore so an abort or
+          # rollback cannot replace its App-token-aware release command with a
+          # predecessor helper. On resume HEAD is the verified transition branch
+          # and its parent was proved to be the current protected default head.
+          if test "$RESUME" = true; then
+            producer_sha=$(git rev-parse HEAD^)
+          else
+            producer_sha=$(git rev-parse HEAD)
+          fi
+          [[ "$producer_sha" =~ ^[0-9a-f]{40}$ ]]
+          producer_root="$RUNNER_TEMP/agent-policy-transition-producer"
+          rm -rf "$producer_root"
+          mkdir -p "$producer_root"
+          git archive "$producer_sha" | tar -x -C "$producer_root"
+          test -x "$producer_root/scripts/hv-agent" || {
+            echo 'trusted transition producer runtime is incomplete' >&2
+            exit 1
+          }
+          test -x "$producer_root/scripts/hv-agent-generated-transition-claim" || {
+            echo 'trusted transition producer claim helper is incomplete' >&2
+            exit 1
+          }
+          echo "HV_AGENT_POLICY_PRODUCER_ROOT=$producer_root" >> "$GITHUB_ENV"
+
           artifact=$(jq -r '.channels.stable.artifact' .github/agent-policy-channels.json)
           case "$artifact" in
             ghcr.io/happyvertical/agent-policy@sha256:*) ;;
@@ -265,48 +525,195 @@ jobs:
                       f"restored stable lock {field} does not match the signed artifact manifest"
                   )
           PY
+          stable_generation=$(jq -er '.generation | select(type == "number" and . >= 1)' \
+            "$RUNNER_TEMP/stable-policy/policy-artifact.json")
           substrate_pairs=(
             "templates/github/agent-policy-authority.yml:.github/workflows/agent-policy.yml"
             "templates/github/agent-policy-rollout.yml:.github/workflows/agent-policy-rollout.yml"
+            "scripts/hv-agent:scripts/hv-agent"
             "scripts/hv-agent-policy-channel-select:scripts/hv-agent-policy-channel-select"
             "scripts/hv-agent-policy-canary:scripts/hv-agent-policy-canary"
             "scripts/hv-agent-policy-channels:scripts/hv-agent-policy-channels"
+            "scripts/hv-agent-generated-transition-claim:scripts/hv-agent-generated-transition-claim"
+            "scripts/hv_agent_formatting.py:scripts/hv_agent_formatting.py"
+            "scripts/hv_agent_formatting_rollout.py:scripts/hv_agent_formatting_rollout.py"
+            "scripts/hv_agent_github.py:scripts/hv_agent_github.py"
+            "scripts/hv_agent_lifecycle.py:scripts/hv_agent_lifecycle.py"
             "scripts/hv_agent_policy_channels.py:scripts/hv_agent_policy_channels.py"
           )
           for pair in "${substrate_pairs[@]}"; do
             source="$RUNNER_TEMP/stable-policy/${pair%%:*}"
             installed=${pair#*:}
-            test -f "$source" || {
+            if ! test -f "$source"; then
+              # Generation 24 predates the producer-only transition helper.
+              # Remove it from an abort/rollback PR so the committed substrate
+              # remains the exact signed predecessor; its separately archived
+              # generation-27 producer still settles this PR's claim below.
+              if test "$stable_generation" -lt 27 \
+                  && test "$installed" = scripts/hv-agent-generated-transition-claim; then
+                rm -f "$installed"
+                continue
+              fi
               echo "restored policy artifact lacks $installed substrate" >&2
               exit 1
-            }
+            fi
             cmp -s "$source" "$installed" || cp -p "$source" "$installed"
           done
       - name: Open protected transition pull request
         if: ${{ steps.phase.outputs.phase != 'none' }}
         env:
           GH_TOKEN: ${{ steps.promoter-token.outputs.token }}
+          HV_AGENT_APP_SLUG: ${{ steps.promoter-token.outputs.app-slug }}
+          RESUME: ${{ steps.resume.outputs.resume }}
+          PRODUCER_ROOT: ${{ env.HV_AGENT_POLICY_PRODUCER_ROOT }}
         run: |
           set -euo pipefail
+          # This is the persistent identity for one protected channel
+          # transition. Retried workflow attempts resume it rather than
+          # overwriting metadata on a new session.
           branch="agent/policy-channel-${revision}-${action}"
+          session="policy-rollout-${action}-revision-${revision}"
+          test -x "$PRODUCER_ROOT/scripts/hv-agent" || {
+            echo 'trusted transition producer runtime is unavailable' >&2
+            exit 1
+          }
+          test -x "$PRODUCER_ROOT/scripts/hv-agent-generated-transition-claim" || {
+            echo 'trusted transition producer claim helper is unavailable' >&2
+            exit 1
+          }
           git config user.name "hv-agent-promoter[bot]"
           git config user.email "hv-agent-promoter[bot]@users.noreply.github.com"
           gh auth setup-git
-          git switch -c "$branch"
-          git add .github/agent-policy-channels.json .github/agent-policy-lock.json \
-            "$evidence_path" "$evidence_bundle_path" \
-            .github/workflows/agent-policy.yml \
-            .github/workflows/agent-policy-rollout.yml \
-            scripts/hv-agent-policy-channel-select \
-            scripts/hv-agent-policy-canary \
-            scripts/hv-agent-policy-channels \
-            scripts/hv_agent_policy_channels.py
-          git commit -m "chore(agent-policy): ${action} channel revision ${revision}"
-          git push origin "$branch"
+          transition_marker="<!-- hv-agent-policy-transition:v2 action=$action revision=$revision branch=$branch -->"
+          test -n "$HV_AGENT_APP_SLUG"
+          producer_owner="${HV_AGENT_APP_SLUG}[bot]"
+          test "$(gh api "users/$producer_owner" --jq .login)" = "$producer_owner"
+          open_transitions=$(gh api --paginate --slurp \
+            'repos/happyvertical/.github/pulls?state=open&per_page=100' | \
+            jq '[.[][] | {
+              number, title, url: .html_url, body,
+              author: (.user.login // ""),
+              head_ref: (.head.ref // ""),
+              head_sha: (.head.sha // ""),
+              head_repository: (.head.repo.full_name // ""),
+              base_ref: (.base.ref // ""),
+              base_sha: (.base.sha // ""),
+              base_repository: (.base.repo.full_name // "")
+            } | select((.body // "") | contains("<!-- hv-agent-policy-transition:v2 "))]')
+          matching_transitions=$(jq --arg marker "$transition_marker" \
+            '[.[] | select((.body // "") | contains($marker))]' <<<"$open_transitions")
+          if test "$(jq -r 'length' <<<"$matching_transitions")" -gt 1 \
+              || test "$(jq -r 'length' <<<"$open_transitions")" -gt \
+                 "$(jq -r 'length' <<<"$matching_transitions")"; then
+            {
+              echo 'a different protected channel transition is already open; land or close it before retrying rollout'
+              jq -r '.[] | "  \(.url) — \(.title)"' <<<"$open_transitions"
+            } >&2
+            exit 1
+          fi
+          existing_url=$(jq -r 'if length == 0 then "" elif length == 1 then .[0].url else error("duplicate generated transition PRs") end' <<<"$matching_transitions")
+          if test "$RESUME" = true; then
+            base_sha=$(git rev-parse HEAD^)
+          else
+            base_sha=$(git rev-parse HEAD)
+          fi
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then
+            test "$RESUME" = true || {
+              echo "generated transition branch appeared while opening a new transition; rerun to verify and resume it" >&2
+              exit 1
+            }
+            test "$(git branch --show-current)" = "$branch" || {
+              echo "verified generated transition branch is not checked out" >&2
+              exit 1
+            }
+          else
+            test -z "$existing_url" || {
+              echo "generated transition PR exists but its head branch is unavailable" >&2
+              exit 1
+            }
+            tree_manifest_path=".github/agent-policy-evidence/revision-${revision}.tree.json"
+            tree_manifest_bundle_path=".github/agent-policy-evidence/revision-${revision}.tree.bundle"
+            # Stage the complete restored substrate as an exact tree. `-A` is
+            # required for a rollback to generation 24, which intentionally
+            # deletes the later producer-only claim helper.
+            git add -A -- .github/agent-policy-channels.json .github/agent-policy-lock.json \
+              "$evidence_path" "$evidence_bundle_path" \
+              .github/workflows/agent-policy.yml \
+              .github/workflows/agent-policy-rollout.yml \
+              scripts/hv-agent \
+              scripts/hv-agent-policy-channel-select \
+              scripts/hv-agent-policy-canary \
+              scripts/hv-agent-policy-channels \
+              scripts/hv-agent-generated-transition-claim \
+              scripts/hv_agent_formatting.py \
+              scripts/hv_agent_formatting_rollout.py \
+              scripts/hv_agent_github.py \
+              scripts/hv_agent_lifecycle.py \
+              scripts/hv_agent_policy_channels.py
+            python3 - "$base_sha" "$tree_manifest_path" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path, PurePosixPath
+          import subprocess
+          import sys
+
+          base_sha, manifest_path = sys.argv[1:]
+          components: dict[str, str | None] = {}
+          for line in subprocess.run(
+              ["git", "diff", "--cached", "--name-status", "--no-renames"],
+              check=True, text=True, capture_output=True,
+          ).stdout.splitlines():
+              status, path = line.split("\t", 1)
+              pure = PurePosixPath(path)
+              if (
+                  status not in {"A", "M", "D"}
+                  or str(pure) != path
+                  or pure.is_absolute()
+                  or ".." in pure.parts
+              ):
+                  raise SystemExit("generated transition tree has an unsupported deletion, rename, or path")
+              components[path] = (
+                  hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                  if status in {"A", "M"} else None
+              )
+          if not components:
+              raise SystemExit("generated transition tree is empty")
+          Path(manifest_path).write_text(json.dumps({
+              "schema": "hv-agent-policy-transition-tree:v1",
+              "base_sha": base_sha,
+              "components": components,
+          }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+            cosign sign-blob --yes --bundle "$tree_manifest_bundle_path" \
+              "$tree_manifest_path"
+            git add "$tree_manifest_path" "$tree_manifest_bundle_path"
+            git switch -c "$branch"
+            git commit -m "chore(agent-policy): ${action} channel revision ${revision}"
+            git push origin "$branch"
+          fi
+          head_sha=$(git rev-parse HEAD)
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          if test -n "$existing_url"; then
+            jq -e --arg owner "$producer_owner" --arg branch "$branch" \
+              --arg head_sha "$head_sha" --arg base_sha "$base_sha" '
+                .[0] | select(
+                  .author == $owner
+                  and .head_ref == $branch
+                  and .head_sha == $head_sha
+                  and .head_repository == "happyvertical/.github"
+                  and .base_ref == "main"
+                  and .base_sha == $base_sha
+                  and .base_repository == "happyvertical/.github"
+                )' <<<"$matching_transitions" >/dev/null || {
+              echo "existing generated transition PR does not have the exact protected producer identity" >&2
+              exit 1
+            }
+          fi
           body="$RUNNER_TEMP/promotion-pr.md"
           issue_body="$RUNNER_TEMP/promotion-issue.md"
-          session="policy-rollout-$GITHUB_RUN_ID"
           {
+            echo "$transition_marker"
             echo "Protected policy-channel transition generated by the rollout workflow."
             echo
             echo "- Action: \`$action\`"
@@ -314,12 +721,44 @@ jobs:
             echo "- Claim runtime: \`github-actions\`"
             echo "- Claim session: \`$session\`"
             echo
-            echo "Claim and release this issue through the canonical lifecycle before merging its PR."
+            echo "The producer creates and releases its exact claim through the canonical lifecycle before the PR is reviewed."
           } > "$issue_body"
-          issue_url=$(gh issue create --repo happyvertical/.github \
-            --title "chore(agent-policy): ${action} channel revision ${revision}" \
-            --body-file "$issue_body")
-          issue_number=${issue_url##*/}
+          matching_issues=$(gh api --paginate --slurp \
+            'repos/happyvertical/.github/issues?state=open&per_page=100' | \
+            jq -er --arg marker "$transition_marker" '
+              [.[][] | select(.pull_request == null and (.body // "" | contains($marker)))
+               | {number, author: (.user.login // "")}]
+            ')
+          issue_number=$(jq -er 'if length == 0 then "" elif length == 1 then .[0].number else error("duplicate generated transition issues") end' <<<"$matching_issues")
+          if test -z "$issue_number"; then
+            issue_url=$(gh issue create --repo happyvertical/.github \
+              --title "chore(agent-policy): ${action} channel revision ${revision}" \
+              --body-file "$issue_body")
+            issue_number=${issue_url##*/}
+          else
+            jq -e --arg owner "$producer_owner" \
+              '.[0] | select(.author == $owner)' <<<"$matching_issues" >/dev/null || {
+              echo "existing generated transition issue is not owned by the protected producer" >&2
+              exit 1
+            }
+          fi
+          [[ "$issue_number" =~ ^[1-9][0-9]*$ ]]
+          if test -n "$existing_url"; then
+            url="$existing_url"
+            pr_number=${url##*/}
+            echo "Reusing generated transition $url; completing its producer metadata"
+          else
+            # GitHub allocates the PR number at creation. Keep the PR draft
+            # until the producer has written and released its exact-number
+            # metadata and claim; ready-for-review then starts the first
+            # evaluated lifecycle. A retry resumes that same bounded sequence.
+            url=$(gh pr create --repo happyvertical/.github --base main --head "$branch" \
+              --title "chore(agent-policy): ${action} channel revision ${revision}" \
+              --draft \
+              --body-file "$issue_body")
+            pr_number=${url##*/}
+          fi
+          [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]
           runtime_policy_revision=$(
             jq -er '.policy_revision | select(type == "string" and length > 0)' \
               .github/agent-policy-lock.json
@@ -330,7 +769,23 @@ jobs:
                | select(type == "string" and test("^[0-9a-f]{64}$"))' \
               .github/agent-policy-channels.json
           )
+          run_transition='{}'
+          if test "$action" != abort && test "$action" != rollback; then
+            run_transition=$(jq -cn \
+              --argjson pr_number "$pr_number" \
+              --arg branch "$branch" \
+              --arg head_sha "$head_sha" \
+              --arg session "$session" \
+              '{generated_transition: {
+                pr_number: $pr_number,
+                head_branch: $branch,
+                head_sha: $head_sha,
+                runtime: "github-actions",
+                session: $session
+              }}')
+          fi
           {
+            echo "$transition_marker"
             echo "Automated protected policy-channel transition."
             echo
             echo "- Action: \`$action\`"
@@ -343,21 +798,110 @@ jobs:
             echo "<!-- hv-agent-run:v1 -->"
             jq -cn \
               --arg session "$session" \
-              --arg issue "$issue_number" \
+              --argjson issue "$issue_number" \
+              --argjson pr_number "$pr_number" \
+              --arg branch "$branch" \
+              --arg head_sha "$head_sha" \
               --arg policy_revision "$runtime_policy_revision" \
+              --argjson run_transition "$run_transition" \
               '{
                 schema: "hv-agent-run:v1",
                 runtime: "github-actions",
                 session: $session,
                 issue: $issue,
                 policy_revision: $policy_revision,
+                status: "complete",
                 validation: [
                   "protected rollout recorded a signed exact-default-head evidence bundle",
                   "canonical channel transition applied at the expected revision"
                 ]
-              }'
+              } + $run_transition'
           } > "$body"
-          url=$(gh pr create --repo happyvertical/.github --base main --head "$branch" \
-            --title "chore(agent-policy): ${action} channel revision ${revision}" \
-            --body-file "$body")
+          gh pr edit "$pr_number" --repo happyvertical/.github --body-file "$body"
+          # Bind the installation token by a server-attributed status on the
+          # exact generated head before it creates or releases the claim.
+          producer_status_context="hv-agent/producer/$session"
+          gh api --method POST "repos/happyvertical/.github/statuses/$head_sha" \
+            -f state=success -f "context=$producer_status_context" \
+            -f "description=generated transition producer $session" \
+            -f "target_url=$url" >/dev/null
+          claim_body="$RUNNER_TEMP/promotion-claim.md"
+          owner="$producer_owner"
+          claimed_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          {
+            echo "<!-- hv-agent-claim:v1 -->"
+            echo '```json'
+            jq -cn \
+              --arg owner "$owner" \
+              --arg session "$session" \
+              --arg branch "$branch" \
+              --arg head_sha "$head_sha" \
+              --arg claimed_at "$claimed_at" \
+              --argjson issue_number "$issue_number" \
+              --argjson pr_number "$pr_number" \
+              '{
+                schema: "hv-agent-claim:v1",
+                runtime: "github-actions",
+                owner: $owner,
+                session: $session,
+                branch: $branch,
+                worktree: null,
+                claimed_at: $claimed_at,
+                heartbeat_at: $claimed_at,
+                lease_seconds: 14400,
+                generated_transition: {
+                  issue_number: $issue_number,
+                  pr_number: $pr_number,
+                  head_branch: $branch,
+                  head_sha: $head_sha,
+                  runtime: "github-actions",
+                  session: $session
+                }
+              }'
+            echo '```'
+          } > "$claim_body"
+          claim_comments="$RUNNER_TEMP/promotion-claim-comments.json"
+          claim_plan="$RUNNER_TEMP/promotion-claim-plan.json"
+          expired_claim_body="$RUNNER_TEMP/promotion-expired-claim.md"
+          gh api --paginate --slurp \
+            "repos/happyvertical/.github/issues/$issue_number/comments?per_page=100" > "$claim_comments"
+          "$PRODUCER_ROOT/scripts/hv-agent-generated-transition-claim" \
+            --comments "$claim_comments" --owner "$producer_owner" \
+            --session "$session" --branch "$branch" --head-sha "$head_sha" \
+            --issue-number "$issue_number" --pr-number "$pr_number" \
+            --output "$claim_plan" --expired-body "$expired_claim_body"
+          claim_mode=$(jq -er '.mode' "$claim_plan")
+          claim_comment_id=$(jq -er '.claim_comment_id // empty' "$claim_plan")
+          expired_claim_database_id=$(jq -r '.database_id // ""' "$claim_plan")
+          case "$claim_mode" in
+            new)
+              gh api --method POST "repos/happyvertical/.github/issues/$issue_number/labels" \
+                -f 'labels[]=agent: implementation' >/dev/null
+              claim_comment_id=$(gh api --method POST \
+                "repos/happyvertical/.github/issues/$issue_number/comments" \
+                -F "body=@$claim_body" --jq .node_id)
+              ;;
+            reclaim)
+              gh api --method PATCH \
+                "repos/happyvertical/.github/issues/comments/$expired_claim_database_id" \
+                -F "body=@$expired_claim_body" >/dev/null
+              claim_comment_id=$(gh api --method POST \
+                "repos/happyvertical/.github/issues/$issue_number/comments" \
+                -F "body=@$claim_body" --jq .node_id)
+              ;;
+            active|released) ;;
+            *) echo "unexpected generated transition claim plan: $claim_mode" >&2; exit 1 ;;
+          esac
+          test -n "$claim_comment_id"
+          (
+            cd "$GITHUB_WORKSPACE"
+            HV_AGENT_APP_SLUG="$HV_AGENT_APP_SLUG" \
+              HV_AGENT_APP_PROOF_REPOSITORY=happyvertical/.github \
+              "$PRODUCER_ROOT/scripts/hv-agent" release "$issue_number" \
+              --repo happyvertical/.github --session "$session" \
+              --claim-comment-id "$claim_comment_id" --apply
+          )
+          if test "$(gh pr view "$pr_number" --repo happyvertical/.github --json isDraft --jq .isDraft)" = true; then
+            gh pr ready "$pr_number" --repo happyvertical/.github
+          fi
           echo "Opened $url; merge only after the canonical issue claim, review release, and required checks complete."
