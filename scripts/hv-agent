@@ -3559,7 +3559,7 @@ def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
     repository = trusted_repository or manifest_repository
     if trusted_repository and manifest_repository != trusted_repository:
         errors.append(
-            f"tracker.repository {manifest_repository} does not match trusted workflow "
+            f"forge.repository {manifest_repository} does not match trusted workflow "
             f"repository {trusted_repository}; restore generated project policy"
         )
     pr = lifecycle_pull_request(repository, number)

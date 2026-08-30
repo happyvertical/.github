@@ -3000,24 +3000,37 @@ def claim_comment_records(
             continue
         if not authority_comment_trusted(heartbeat_comment):
             continue
+        heartbeat_comment_id = heartbeat_comment.get("id")
+        heartbeat_comment_url = str(
+            heartbeat_comment.get("html_url") or heartbeat_comment.get("htmlUrl") or ""
+        )
         heartbeat = parse_marked(body, HEARTBEAT_MARKER, "hv-agent-heartbeat:v1")
         if heartbeat is None:
             errors.append(
-                f"issue #{number} has a malformed hv-agent-heartbeat:v1 comment; "
-                "ignore or remove that renewal record before continuing"
+                f"issue #{number} heartbeat comment {heartbeat_comment_id} "
+                f"({heartbeat_comment_url}) is not valid hv-agent-heartbeat:v1 JSON; "
+                "delete that heartbeat comment, then re-post it with "
+                f"`hv-agent heartbeat {number} --session SESSION`"
+                " (the development CLI also needs `--apply`)"
             )
             continue
         heartbeat_error = heartbeat_payload_error(heartbeat)
         if heartbeat_error:
             errors.append(
-                f"issue #{number} has an invalid hv-agent-heartbeat:v1 comment "
-                f"({heartbeat_error}); ignore or remove that renewal record before continuing"
+                f"issue #{number} heartbeat comment {heartbeat_comment_id} "
+                f"({heartbeat_comment_url}) has an invalid hv-agent-heartbeat:v1 field "
+                f"({heartbeat_error}); delete that heartbeat comment, then re-post it "
+                f"with `hv-agent heartbeat {number} --session SESSION`"
+                " (the development CLI also needs `--apply`)"
             )
             continue
         if heartbeat_comment.get("lastEditedAt") is not None:
             errors.append(
-                f"issue #{number} heartbeat was edited after creation; ignore or remove "
-                "that renewal record before continuing"
+                f"issue #{number} heartbeat comment {heartbeat_comment_id} "
+                f"({heartbeat_comment_url}) was edited after creation; delete that "
+                "heartbeat comment, then re-post it with "
+                f"`hv-agent heartbeat {number} --session SESSION`"
+                " (the development CLI also needs `--apply`)"
             )
             continue
         target = by_id.get(str(heartbeat.get("claim_comment_id")))
@@ -3238,17 +3251,52 @@ def claim_history_classification(
     return records, errors, orphaned_id
 
 
+def malformed_heartbeat_comments(issue: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return (id, url) pairs for trusted heartbeat comments that fail validation.
+
+    Covers exactly the three defects the claim/heartbeat parser refuses: a
+    malformed `hv-agent-heartbeat:v1` marker, an invalid payload field, or a
+    comment edited after creation. Lets the audit report name these defects by
+    comment id and URL alongside their claim instead of leaving them only
+    inside prose error strings.
+    """
+    defects: list[tuple[str, str]] = []
+    for heartbeat_comment in issue.get("comments", []):
+        if not isinstance(heartbeat_comment, dict):
+            continue
+        body = str(heartbeat_comment.get("body", ""))
+        if HEARTBEAT_MARKER not in body:
+            continue
+        if not authority_comment_trusted(heartbeat_comment):
+            continue
+        heartbeat = parse_marked(body, HEARTBEAT_MARKER, "hv-agent-heartbeat:v1")
+        malformed = heartbeat is None
+        invalid = not malformed and bool(heartbeat_payload_error(heartbeat))
+        edited = heartbeat_comment.get("lastEditedAt") is not None
+        if not (malformed or invalid or edited):
+            continue
+        comment_id = str(heartbeat_comment.get("id") or "")
+        comment_url = str(
+            heartbeat_comment.get("html_url") or heartbeat_comment.get("htmlUrl") or ""
+        )
+        defects.append((comment_id, comment_url))
+    return defects
+
+
 def claim_audit_entries(
     issues: Iterable[dict[str, Any]],
-) -> list[tuple[str, str, list[str], list[str]]]:
+) -> list[tuple[str, str, list[str], list[str], list[tuple[str, str]]]]:
     """Deterministic, never-raising audit of malformed claim histories.
 
-    Returns one (number, state, errors, claim_comment_ids) entry per issue whose
-    history is malformed and not recoverable as an orphaned generation, sorted by
-    issue number for stable, repeatable output. Mirrors what a broad reconcile
-    contains: every malformed history in one pass, in canonical order.
+    Returns one (number, state, errors, claim_comment_ids, heartbeat_defects)
+    entry per issue whose history is malformed and not recoverable as an
+    orphaned generation, sorted by issue number for stable, repeatable output.
+    `heartbeat_defects` is a list of (comment_id, comment_url) pairs for any
+    malformed or edited heartbeat comment on that issue, surfaced alongside
+    the claim comment ids. Mirrors what a broad reconcile contains: every
+    malformed history in one pass, in canonical order.
     """
-    entries: list[tuple[str, str, list[str], list[str]]] = []
+    entries: list[tuple[str, str, list[str], list[str], list[tuple[str, str]]]] = []
     for issue in issues:
         _records, errors, orphaned_id = claim_history_classification(issue)
         if not errors or orphaned_id is not None:
@@ -3266,6 +3314,7 @@ def claim_audit_entries(
             str(issue.get("state") or "UNKNOWN"),
             list(errors),
             claim_ids,
+            malformed_heartbeat_comments(issue),
         ))
     entries.sort(
         key=lambda entry: (int(entry[0]) if str(entry[0]).isdigit() else 0, entry[0]),
