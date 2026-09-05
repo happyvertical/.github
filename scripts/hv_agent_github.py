@@ -1845,3 +1845,13 @@ def retryable_gh_command(arguments: list[str]) -> bool:
     ):
         return True
     return method in {"GET", "PUT", "PATCH", "DELETE"}
+
+
+def review_record_rest(run_json: JsonRunner, method: str, path: str, payload: dict | None = None) -> Any:
+    """Bounded REST-only transport for optional review telemetry."""
+    if method not in {'GET', 'POST', 'PATCH'} or path == 'graphql':
+        raise ValueError('invalid review-record transport')
+    args = ['gh', 'api', '--method', method, path]
+    if payload is not None:
+        args += ['-f', 'body=' + payload['body']]
+    return run_json(args)
