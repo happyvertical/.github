@@ -19,6 +19,9 @@ from typing import Any
 CLAIM_MARKER = "<!-- hv-agent-claim:v1 -->"
 HEARTBEAT_MARKER = "<!-- hv-agent-heartbeat:v1 -->"
 OWNER_REPAIR_MARKER = "<!-- hv-agent-claim-owner-repair:v1 -->"
+GENERATED_TRANSITION_RECOVERY_MARKER = (
+    "<!-- hv-agent-generated-transition-recovery:v1 -->"
+)
 RUN_MARKER = "<!-- hv-agent-run:v1 -->"
 CLAIM_LABEL = "agent: implementation"
 BLOCKED_LABEL = "status: blocked"
@@ -2239,6 +2242,59 @@ def claim_payload_error(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def generated_transition_recovery_payload_error(
+    payload: dict[str, Any],
+) -> str | None:
+    """Validate one append-only recovery record for a generated transition."""
+    fields = {
+        "schema", "repository", "issue_number", "pr_number", "head_branch",
+        "head_sha", "producer_owner", "producer_session",
+        "producer_claim_comment_id", "conflicting_claim_comment_id",
+        "conflicting_claim_owner", "reason", "recovered_at",
+    }
+    if set(payload) != fields:
+        return "recovery record has unexpected or missing fields"
+    if payload.get("schema") != "hv-agent-generated-transition-recovery:v1":
+        return "recovery record schema is not hv-agent-generated-transition-recovery:v1"
+    repository = payload.get("repository")
+    if not isinstance(repository, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository,
+    ):
+        return "recovery repository must be OWNER/REPOSITORY"
+    for name in ("issue_number", "pr_number"):
+        value = payload.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return f"recovery {name} must be a positive integer"
+    for name in (
+        "head_branch", "producer_owner", "producer_session",
+        "producer_claim_comment_id", "conflicting_claim_comment_id",
+        "conflicting_claim_owner",
+    ):
+        if not isinstance(payload.get(name), str) or not payload[name]:
+            return f"recovery {name} must be a non-empty string"
+    if not payload["producer_owner"].endswith("[bot]"):
+        return "recovery producer_owner must be a GitHub App actor"
+    if payload["producer_claim_comment_id"] == payload["conflicting_claim_comment_id"]:
+        return "recovery producer and conflicting claim comments must differ"
+    if payload["producer_owner"] == payload["conflicting_claim_owner"]:
+        return "recovery conflicting claim must not be owned by the producer"
+    if not isinstance(payload.get("head_sha"), str) \
+            or not re.fullmatch(r"[0-9a-f]{40}", payload["head_sha"]):
+        return "recovery head_sha must be a lowercase Git SHA"
+    if payload.get("reason") != "generated-transition-conflict":
+        return "recovery reason must be generated-transition-conflict"
+    if parse_timestamp(payload.get("recovered_at")) is None:
+        return "recovery recovered_at must be an RFC 3339 timestamp"
+    return None
+
+
+def format_generated_transition_recovery(payload: dict[str, Any]) -> str:
+    return (
+        GENERATED_TRANSITION_RECOVERY_MARKER + "\n```json\n"
+        + json.dumps(payload, sort_keys=True) + "\n```"
+    )
+
+
 def heartbeat_payload_error(payload: dict[str, Any]) -> str | None:
     """Validate one append-only lease renewal linked to a claim cycle."""
     for name in ("claim_comment_id", "session"):
@@ -2360,6 +2416,19 @@ def authority_comment_trusted(comment: dict[str, Any]) -> bool:
     association = str(comment.get("authorAssociation", "")).upper()
     return association in TRUSTED_AUTHOR_ASSOCIATIONS \
         or comment_generation_actor_matches(comment)
+
+
+def generated_transition_recovery_author_matches(
+    comment: dict[str, Any],
+    producer_comment: dict[str, Any],
+    producer: dict[str, Any],
+) -> bool:
+    """Bind recovery evidence to the server actor that authored the producer claim."""
+    if str(comment.get("authorLogin") or "") != str(producer.get("owner") or ""):
+        return False
+    author_node_id = str(comment.get("authorNodeId") or "")
+    producer_node_id = str(producer_comment.get("authorNodeId") or "")
+    return bool(author_node_id and producer_node_id and author_node_id == producer_node_id)
 
 
 def release_evidence_payload(
@@ -2785,6 +2854,46 @@ def claim_comment_records(
     records: list[tuple[dict[str, Any], dict[str, Any]]] = []
     errors: list[str] = []
     owner_repairs: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    recovery_records: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    recovery_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    recovery_malformed_candidates: list[dict[str, Any]] = []
+    recovery_conflicts: set[str] = set()
+    recovery_bindings: dict[str, str] = {}
+    for recovery_comment in issue.get("comments", []):
+        if not isinstance(recovery_comment, dict):
+            continue
+        body = str(recovery_comment.get("body", ""))
+        if GENERATED_TRANSITION_RECOVERY_MARKER not in body:
+            continue
+        recovery = parse_marked(
+            body,
+            GENERATED_TRANSITION_RECOVERY_MARKER,
+            "hv-agent-generated-transition-recovery:v1",
+        )
+        if recovery is None:
+            if not authority_comment_trusted(recovery_comment):
+                recovery_malformed_candidates.append(recovery_comment)
+                continue
+            errors.append(
+                f"issue #{number} has a malformed generated-transition recovery record; "
+                "rerun the authenticated producer recovery"
+            )
+            continue
+        recovery_error = generated_transition_recovery_payload_error(recovery)
+        if recovery_error:
+            if not authority_comment_trusted(recovery_comment):
+                recovery_malformed_candidates.append(recovery_comment)
+                continue
+            errors.append(
+                f"issue #{number} has an invalid generated-transition recovery record "
+                f"({recovery_error}); recover the exact transition through its producer"
+            )
+            continue
+        recovery_candidates.append((recovery_comment, recovery))
+    recovery_target_ids = {
+        str(recovery.get("conflicting_claim_comment_id"))
+        for _comment, recovery in recovery_candidates
+    }
     for repair_comment in issue.get("comments", []):
         if not isinstance(repair_comment, dict):
             continue
@@ -2943,6 +3052,13 @@ def claim_comment_records(
                         "recover the cycle manually"
                     )
                     continue
+            elif comment_id in recovery_target_ids:
+                if not payload.get("owner") or payload.get("owner") != author:
+                    errors.append(
+                        f"issue #{number} recovered claim comment {comment_id} owner does "
+                        "not match its trusted GitHub author"
+                    )
+                    continue
             elif not payload.get("released_at"):
                 errors.append(
                     f"issue #{number} claim owner {payload.get('owner')} does not match "
@@ -2980,11 +3096,132 @@ def claim_comment_records(
             # server-owned timeline classification.
             comment["_issueIncarnationCurrent"] = not bool(issue.get("hasReopened"))
         records.append((comment, payload))
+    for recovery_comment in recovery_malformed_candidates:
+        if any(
+            generated_transition_recovery_author_matches(
+                recovery_comment, producer_comment, producer,
+            )
+            for producer_comment, producer in records
+        ):
+            errors.append(
+                f"issue #{number} has a malformed generated-transition recovery record; "
+                "rerun the authenticated producer recovery"
+            )
+    for recovery_comment, recovery in recovery_candidates:
+        producer_id = str(recovery.get("producer_claim_comment_id"))
+        producer_matches = [
+            pair for pair in records if str(pair[0].get("id")) == producer_id
+        ]
+        if len(producer_matches) != 1:
+            errors.append(
+                f"issue #{number} generated-transition recovery does not reference "
+                "exactly one producer claim"
+            )
+            continue
+        producer_comment, producer = producer_matches[0]
+        if not generated_transition_recovery_author_matches(
+            recovery_comment, producer_comment, producer,
+        ):
+            errors.append(
+                f"issue #{number} generated-transition recovery author does not match "
+                "the authenticated producer"
+            )
+            continue
+        if recovery_comment.get("lastEditedAt") is not None:
+            errors.append(
+                f"issue #{number} generated-transition recovery was edited after creation; "
+                "recover the exact transition through its producer"
+            )
+            continue
+        if parse_timestamp(recovery_comment.get("createdAt")) is None:
+            errors.append(
+                f"issue #{number} generated-transition recovery lacks a valid createdAt; "
+                "reread GitHub before continuing"
+            )
+            continue
+        issue_match = re.fullmatch(
+            r"https://github\.com/([^/]+/[^/]+)/issues/([1-9][0-9]*)/?",
+            str(issue.get("url") or ""),
+        )
+        if issue_match is None \
+                or recovery.get("repository") != issue_match.group(1) \
+                or recovery.get("issue_number") != int(number):
+            errors.append(
+                f"issue #{number} generated-transition recovery is bound to a different "
+                "repository or issue"
+            )
+            continue
+        recovery_records.append((recovery_comment, recovery))
+    for recovery_comment, recovery in recovery_records:
+        recovery_id = str(recovery_comment.get("id"))
+        conflicting_id = str(recovery.get("conflicting_claim_comment_id"))
+        producer_id = str(recovery.get("producer_claim_comment_id"))
+        if conflicting_id in recovery_conflicts:
+            errors.append(
+                f"issue #{number} has duplicate generated-transition recovery records "
+                f"for claim comment {conflicting_id}"
+            )
+            continue
+        producer_matches = [
+            pair for pair in records if str(pair[0].get("id")) == producer_id
+        ]
+        conflict_matches = [
+            pair for pair in records if str(pair[0].get("id")) == conflicting_id
+        ]
+        if len(producer_matches) != 1 or len(conflict_matches) != 1:
+            errors.append(
+                f"issue #{number} generated-transition recovery {recovery_id} does not "
+                "reference exactly one producer claim and one conflicting claim"
+            )
+            continue
+        prior_conflict = recovery_bindings.get(producer_id)
+        if prior_conflict is not None and prior_conflict != conflicting_id:
+            errors.append(
+                f"issue #{number} has multiple generated-transition recovery targets "
+                f"for producer claim {producer_id}"
+            )
+            continue
+        _producer_comment, producer = producer_matches[0]
+        _conflict_comment, conflict = conflict_matches[0]
+        transition = producer.get("generated_transition")
+        expected_transition = {
+            "issue_number": recovery.get("issue_number"),
+            "pr_number": recovery.get("pr_number"),
+            "head_branch": recovery.get("head_branch"),
+            "head_sha": recovery.get("head_sha"),
+            "runtime": "github-actions",
+            "session": recovery.get("producer_session"),
+        }
+        if transition != expected_transition \
+                or producer.get("owner") != recovery.get("producer_owner") \
+                or not producer.get("released_at") \
+                or producer.get("release_reason") != "review":
+            errors.append(
+                f"issue #{number} generated-transition recovery {recovery_id} is not "
+                "bound to the producer's exact released transition"
+            )
+            continue
+        if conflict.get("released_at") \
+                or conflict.get("owner") != recovery.get("conflicting_claim_owner") \
+                or conflict.get("owner") == producer.get("owner") \
+                or "generated_transition" in conflict:
+            errors.append(
+                f"issue #{number} generated-transition recovery {recovery_id} does not "
+                "identify one unreleased non-producer claim"
+            )
+            continue
+        recovery_conflicts.add(conflicting_id)
+        recovery_bindings[producer_id] = conflicting_id
     for target_id in sorted(set(owner_repairs) - claim_ids):
         errors.append(
             f"issue #{number} owner repair references missing claim comment {target_id}; "
             "remove that compatibility record before continuing"
         )
+    if recovery_conflicts:
+        records = [
+            pair for pair in records
+            if str(pair[0].get("id")) not in recovery_conflicts
+        ]
     # Heartbeats are append-only so they can never overwrite a release that
     # races the renewal. They extend only the exact still-unreleased claim
     # cycle named by claim_comment_id and authored by its canonical owner.
@@ -3035,6 +3272,8 @@ def claim_comment_records(
             continue
         target = by_id.get(str(heartbeat.get("claim_comment_id")))
         if target is None:
+            if str(heartbeat.get("claim_comment_id")) in recovery_conflicts:
+                continue
             errors.append(
                 f"issue #{number} heartbeat references a missing canonical claim comment; "
                 "reread the issue before continuing"

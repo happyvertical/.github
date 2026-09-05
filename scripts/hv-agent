@@ -871,6 +871,145 @@ def require_claim_actor(payload: dict[str, Any], action: str) -> str:
     return actor
 
 
+def generated_transition_recover(args: argparse.Namespace) -> int:
+    """Append producer evidence that terminally settles one foreign claim."""
+    repository = str(args.repo or "")
+    number = str(args.issue)
+    pr_number = int(args.pr_number)
+    if repository != "happyvertical/.github":
+        raise RuntimeError(
+            "generated transition recovery is restricted to happyvertical/.github"
+        )
+    issue = issue_state(repository, number)
+    if issue.get("state") != "OPEN":
+        raise RuntimeError(f"issue #{number} is not open; recovery cannot change its authority")
+    pr = lifecycle_pull_request(repository, pr_number)
+    if pr.get("state") != "OPEN" or pr.get("isDraft"):
+        raise RuntimeError("generated transition recovery requires one open, ready PR")
+    if pr.get("baseRefName") != "main" \
+            or pr.get("headRefName") is None \
+            or pr.get("baseRepositoryDefaultBranch") != "main" \
+            or (pr.get("head") or {}).get("repo", {}).get("full_name") != repository \
+            or (pr.get("base") or {}).get("repo", {}).get("full_name") != repository:
+        raise RuntimeError("generated transition recovery PR is not bound to the exact authority branch")
+    if pr.get("baseRefOid") != args.base_sha:
+        raise RuntimeError("generated transition recovery PR base is not the exact expected SHA")
+    records, errors = lifecycle.claim_comment_records(issue)
+    if errors:
+        raise RuntimeError("invalid canonical claim state:\n" + "\n".join(errors))
+    producer_matches = [
+        pair for pair in records
+        if str(pair[0].get("id")) == str(args.producer_claim_comment_id)
+    ]
+    if len(producer_matches) != 1:
+        raise RuntimeError("producer claim comment id is not one exact canonical claim")
+    producer_comment, producer = producer_matches[0]
+    transition = producer.get("generated_transition")
+    expected_transition = {
+        "issue_number": int(number), "pr_number": pr_number,
+        "head_branch": pr.get("headRefName"), "head_sha": pr.get("headRefOid"),
+        "runtime": "github-actions", "session": producer.get("session"),
+    }
+    if transition != expected_transition or producer.get("owner", "").endswith("[bot]") is False:
+        raise RuntimeError("producer claim is not the exact generated transition for this PR")
+    if not producer.get("released_at") or producer.get("release_reason") != "review":
+        raise RuntimeError("producer claim must already have its exact review release")
+    if pr.get("user", {}).get("login") != producer.get("owner"):
+        raise RuntimeError("generated transition PR author is not the producer claim owner")
+    run_metadata = lifecycle.parse_marked(
+        pr.get("body", ""), RUN_MARKER, "hv-agent-run:v1",
+    )
+    if not isinstance(run_metadata, dict) \
+            or run_metadata.get("runtime") != "github-actions" \
+            or run_metadata.get("session") != producer.get("session") \
+            or run_metadata.get("issue") != int(number) \
+            or run_metadata.get("generated_transition") != {
+                "pr_number": pr_number, "head_branch": pr.get("headRefName"),
+                "head_sha": pr.get("headRefOid"), "runtime": "github-actions",
+                "session": producer.get("session"),
+            }:
+        raise RuntimeError("generated transition PR metadata is not bound to the producer claim")
+    conflicting_matches = [
+        pair for pair in records
+        if str(pair[0].get("id")) == str(args.conflicting_claim_comment_id)
+    ]
+    if not conflicting_matches:
+        existing = [
+            lifecycle.parse_marked(
+                str(comment.get("body") or ""),
+                lifecycle.GENERATED_TRANSITION_RECOVERY_MARKER,
+                "hv-agent-generated-transition-recovery:v1",
+            )
+            for comment in issue.get("comments", [])
+            if isinstance(comment, dict)
+            and lifecycle.generated_transition_recovery_author_matches(
+                comment, producer_comment, producer,
+            )
+            and lifecycle.GENERATED_TRANSITION_RECOVERY_MARKER in str(comment.get("body") or "")
+        ]
+        if any(
+            isinstance(value, dict)
+            and value.get("producer_claim_comment_id") == args.producer_claim_comment_id
+            and value.get("conflicting_claim_comment_id") == args.conflicting_claim_comment_id
+            and value.get("repository") == repository
+            and value.get("issue_number") == int(number)
+            and value.get("pr_number") == pr_number
+            and value.get("head_branch") == pr.get("headRefName")
+            and value.get("head_sha") == pr.get("headRefOid")
+            and value.get("producer_owner") == producer.get("owner")
+            and value.get("producer_session") == producer.get("session")
+            for value in existing
+        ):
+            print(f"generated transition conflict already recovered for {repository}#{number}")
+            return 0
+        raise RuntimeError("conflicting claim comment id is not one exact canonical claim")
+    conflicting_comment, conflicting = conflicting_matches[0]
+    if conflicting.get("released_at") \
+            or conflicting.get("generated_transition") is not None \
+            or conflicting.get("owner") != conflicting_comment.get("authorLogin") \
+            or conflicting.get("owner") == producer.get("owner") \
+            or not lifecycle.claim_pair_active((conflicting_comment, conflicting)):
+        raise RuntimeError("conflicting claim is not one live non-producer claim")
+    require_claim_actor(producer, "recover a generated transition conflict")
+    if not args.apply:
+        print(
+            f"dry-run: recover generated transition conflict {args.conflicting_claim_comment_id}; "
+            "pass --apply to append immutable producer evidence"
+        )
+        return 0
+    payload = {
+        "schema": "hv-agent-generated-transition-recovery:v1",
+        "repository": repository,
+        "issue_number": int(number),
+        "pr_number": pr_number,
+        "head_branch": pr["headRefName"],
+        "head_sha": pr["headRefOid"],
+        "producer_owner": producer["owner"],
+        "producer_session": producer["session"],
+        "producer_claim_comment_id": str(producer_comment["id"]),
+        "conflicting_claim_comment_id": str(conflicting_comment["id"]),
+        "conflicting_claim_owner": conflicting["owner"],
+        "reason": "generated-transition-conflict",
+        "recovered_at": timestamp(),
+    }
+    post_comment(
+        repository, number,
+        lifecycle.format_generated_transition_recovery(payload),
+    )
+    confirmed = issue_state(repository, number)
+    confirmed_records, confirmed_errors = lifecycle.claim_comment_records(confirmed)
+    if confirmed_errors or any(
+        str(comment.get("id")) == str(args.conflicting_claim_comment_id)
+        for comment, _claim in confirmed_records
+    ):
+        raise RuntimeError(
+            "generated transition recovery did not settle the exact conflicting claim; "
+            "preserve history and reread GitHub"
+        )
+    print(f"recovered generated transition conflict for {repository}#{number}")
+    return 0
+
+
 def invalidate_closed_claim_cycle(
     repository: str,
     number: str,
@@ -3655,6 +3794,12 @@ def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
     return errors, notes
 
 
+def git_sha(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError("must be a lowercase 40-hex Git SHA")
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command_name", required=True)
@@ -3691,6 +3836,17 @@ def main() -> int:
     release_mode.add_argument("--blocked", action="store_true")
     release_mode.add_argument("--abandon", action="store_true")
     release.add_argument("--no-project", action="store_true")
+    generated_recovery = commands.add_parser(
+        "generated-transition-recover",
+        help="append authenticated evidence that settles one conflicting non-producer claim",
+    )
+    generated_recovery.add_argument("issue", type=int)
+    generated_recovery.add_argument("--repo", required=True)
+    generated_recovery.add_argument("--pr-number", type=int, required=True)
+    generated_recovery.add_argument("--base-sha", type=git_sha, required=True)
+    generated_recovery.add_argument("--producer-claim-comment-id", required=True)
+    generated_recovery.add_argument("--conflicting-claim-comment-id", required=True)
+    generated_recovery.add_argument("--apply", action="store_true")
     reconcile = commands.add_parser("reconcile")
     reconcile.add_argument("issue", nargs="?", type=int)
     reconcile.add_argument("--repo-path", default=".")
@@ -3730,6 +3886,8 @@ def main() -> int:
             return heartbeat_issue(args)
         if args.command_name == "release":
             return release_issue(args)
+        if args.command_name == "generated-transition-recover":
+            return generated_transition_recover(args)
         if args.command_name == "reconcile":
             return reconcile_issues(args)
         if args.command_name == "project-sync":
