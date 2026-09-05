@@ -901,6 +901,24 @@ jobs:
                 "repos/happyvertical/.github/issues/$issue_number/comments" \
                 -F "body=@$claim_body" --jq .node_id)
               ;;
+            recover)
+              test -n "$claim_comment_id" || {
+                echo 'generated transition recovery plan lacks the conflicting claim id' >&2
+                exit 1
+              }
+              producer_claim_comment_id=$(jq -er '.producer_claim_comment_id' "$claim_plan")
+              (
+                cd "$GITHUB_WORKSPACE"
+                HV_AGENT_APP_SLUG="$HV_AGENT_APP_SLUG" \
+                  HV_AGENT_APP_PROOF_REPOSITORY=happyvertical/.github \
+                  "$PRODUCER_ROOT/scripts/hv-agent" generated-transition-recover "$issue_number" \
+                  --repo happyvertical/.github --pr-number "$pr_number" \
+                  --base-sha "$base_sha" \
+                  --producer-claim-comment-id "$producer_claim_comment_id" \
+                  --conflicting-claim-comment-id "$claim_comment_id" --apply
+              )
+              claim_comment_id="$producer_claim_comment_id"
+              ;;
             active|released) ;;
             *) echo "unexpected generated transition claim plan: $claim_mode" >&2; exit 1 ;;
           esac

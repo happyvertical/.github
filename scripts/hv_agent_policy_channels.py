@@ -545,15 +545,15 @@ def prepare_candidate(
     rollout = candidate.get("rollout")
     if isinstance(rollout, dict) and rollout.get("kind") == "bootstrap-substrate":
         # Runtime-only cuts deliberately do not require consumer migrations.
-        # A substrate/bootstrap cut is different: its declared consumers are
-        # the complete mandatory smoke/migration ring and each must prove the
-        # candidate before readiness can advance the channel. The canary is a
-        # smaller initial slice, so binding this to it would make later smoke
-        # members impossible to reconcile against the declared migration set.
+        # A substrate/bootstrap cut is different: every declared migration
+        # consumer must join the smoke ring and prove the candidate before
+        # readiness can advance. The ring may also contain ordinary smoke
+        # consumers that need no predecessor exception.
         migrations = rollout.get("consumer_migration_repository_ids")
-        if migrations != smoke_ids:
+        if not isinstance(migrations, list) \
+                or not set(migrations).issubset(smoke_ids):
             errors.append(
-                "bootstrap-substrate consumer migrations must exactly match the smoke ring"
+                "bootstrap-substrate consumer migrations must be included in the smoke ring"
             )
     if errors:
         raise PolicyChannelError("invalid promotion rings:\n" + "\n".join(errors))

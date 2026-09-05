@@ -12,8 +12,12 @@ from typing import Any
 
 
 CLAIM_MARKER = "<!-- hv-agent-claim:v1 -->"
+RECOVERY_MARKER = "<!-- hv-agent-generated-transition-recovery:v1 -->"
 CLAIM_PATTERN = re.compile(
     re.escape(CLAIM_MARKER) + r"\n```json\n(?P<payload>[\s\S]*?)\n```\s*$"
+)
+RECOVERY_PATTERN = re.compile(
+    re.escape(RECOVERY_MARKER) + r"\n```json\n(?P<payload>[\s\S]*?)\n```\s*$"
 )
 
 
@@ -47,6 +51,19 @@ def claim_payload(comment: dict[str, Any]) -> dict[str, Any] | None:
     payload = json.loads(match.group("payload"))
     if not isinstance(payload, dict):
         raise ValueError("generated transition claim payload must be an object")
+    return payload
+
+
+def recovery_payload(comment: dict[str, Any]) -> dict[str, Any] | None:
+    body = comment.get("body")
+    if not isinstance(body, str) or RECOVERY_MARKER not in body:
+        return None
+    match = RECOVERY_PATTERN.search(body)
+    if not match:
+        raise ValueError("generated transition recovery marker has malformed JSON fencing")
+    payload = json.loads(match.group("payload"))
+    if not isinstance(payload, dict):
+        raise ValueError("generated transition recovery payload must be an object")
     return payload
 
 
@@ -105,13 +122,26 @@ def main() -> int:
     }
     matching: list[tuple[dict[str, Any], dict[str, Any]]] = []
     replaced_heads: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    foreign: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    recoveries: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for comment in flatten(json.loads(args.comments.read_text(encoding="utf-8"))):
+        author = comment.get("user")
+        trusted_author = isinstance(author, dict) and author.get("login") == args.owner
+        # Recovery markers are authority records.  Ignore markers from arbitrary
+        # commenters before parsing them, matching lifecycle's trust boundary.
+        if not trusted_author:
+            payload = claim_payload(comment)
+            if payload is None:
+                continue
+            foreign.append((comment, payload))
+            continue
+        recovery = recovery_payload(comment)
+        if recovery is not None:
+            recoveries.append((comment, recovery))
+            continue
         payload = claim_payload(comment)
         if payload is None:
             continue
-        author = comment.get("user")
-        if not isinstance(author, dict) or author.get("login") != args.owner:
-            raise ValueError("generated transition claim is not owned by the authenticated producer")
         if (
             payload.get("schema") != "hv-agent-claim:v1"
             or payload.get("runtime") != "github-actions"
@@ -128,6 +158,8 @@ def main() -> int:
             raise ValueError("existing generated transition claim does not match its exact producer identity")
 
     if not matching:
+        if foreign:
+            raise ValueError("generated transition claim is not owned by the authenticated producer")
         live_replaced = [
             pair for pair in replaced_heads if not pair[1].get("released_at")
         ]
@@ -147,6 +179,65 @@ def main() -> int:
         else:
             result = {"mode": "new"}
     else:
+        producer_comment, producer_payload = max(
+            matching,
+            key=lambda pair: timestamp(
+                pair[0].get("updated_at") or pair[1].get("released_at") or pair[1].get("claimed_at")
+            ),
+        )
+        recovery_pairs: set[tuple[Any, Any]] = set()
+        for recovery_comment, recovery in recoveries:
+            author = recovery_comment.get("user")
+            if not isinstance(author, dict) or author.get("login") != args.owner:
+                raise ValueError("generated transition recovery is not owned by the authenticated producer")
+            pair = (
+                recovery.get("producer_claim_comment_id"),
+                recovery.get("conflicting_claim_comment_id"),
+            )
+            if pair in recovery_pairs:
+                raise ValueError("generated transition has duplicate recovery records")
+            recovery_pairs.add(pair)
+        recovered_conflicts = {
+            str(recovery.get("conflicting_claim_comment_id"))
+            for comment, recovery in recoveries
+            if comment.get("user", {}).get("login") == args.owner
+            and recovery.get("schema") == "hv-agent-generated-transition-recovery:v1"
+            and recovery.get("producer_claim_comment_id") == producer_comment.get("node_id")
+            and recovery.get("producer_owner") == args.owner
+            and recovery.get("producer_session") == args.session
+            and recovery.get("repository") == "happyvertical/.github"
+            and recovery.get("issue_number") == args.issue_number
+            and recovery.get("pr_number") == args.pr_number
+            and recovery.get("head_branch") == args.branch
+            and recovery.get("head_sha") == args.head_sha
+        }
+        unresolved_foreign = [
+            pair for pair in foreign
+            if str(pair[0].get("node_id")) not in recovered_conflicts
+        ]
+        if unresolved_foreign:
+            if len(unresolved_foreign) != 1:
+                raise ValueError("generated transition has competing non-producer claim comments")
+            conflict_comment, conflict_payload = unresolved_foreign[0]
+            conflict_author = conflict_comment.get("user")
+            if (
+                not isinstance(conflict_author, dict)
+                or conflict_payload.get("schema") != "hv-agent-claim:v1"
+                or conflict_payload.get("released_at")
+                or conflict_payload.get("generated_transition") is not None
+                or conflict_payload.get("owner") != conflict_author.get("login")
+            ):
+                raise ValueError("generated transition conflict is not one live non-producer claim")
+            conflict_id, database_id = identifiers(conflict_comment)
+            producer_id, _producer_database_id = identifiers(producer_comment)
+            result = {
+                "mode": "recover",
+                "claim_comment_id": conflict_id,
+                "database_id": database_id,
+                "producer_claim_comment_id": producer_id,
+            }
+            args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            return 0
         review = [
             pair for pair in matching
             if pair[1].get("released_at") and pair[1].get("release_reason") == "review"
