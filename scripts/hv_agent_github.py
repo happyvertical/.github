@@ -218,6 +218,23 @@ query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
   rateLimit{cost remaining resetAt}
 }"""
 
+# Fetches one pull request by number regardless of its closing-issue
+# relation, so an explicit `release --pr N` binding can be validated even
+# when the PR's base is not the repository default branch (GitHub never
+# populates closingIssuesReferences for those PRs; see have-config#703).
+PULL_REQUEST_BY_NUMBER_QUERY = """\
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      id number isDraft state body title headRefName headRefOid
+      author{login}
+      mergeQueueEntry{id}
+      repository{nameWithOwner}
+    }
+  }
+  rateLimit{cost remaining resetAt}
+}"""
+
 AUTHORITY_COMMENTS_QUERY = """\
 query($ids:[ID!]!){
   nodes(ids:$ids){

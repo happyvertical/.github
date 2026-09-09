@@ -153,6 +153,10 @@ PROJECTS = github.ProjectV2Client(
     lambda arguments: command_json(arguments), GRAPHQL, RuntimeError,
 )
 _LINKED_CLOSING_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+# Explicit `release --pr N` bindings for this process, keyed by
+# (repository, issue_number) -> (pr_number, claim branch, require_open).
+# See hv-agent's matching definition (have-config#703).
+_EXPLICIT_RELEASE_PR: dict[tuple[str, str], tuple[int, str, bool]] = {}
 _AUTHORITY_COMMENT_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -326,6 +330,54 @@ def ensure_release_status_evidence(
     return digest, max(evidence_times).isoformat().replace("+00:00", "Z")
 
 
+def fetch_pull_request_node(repository: str, pr_number: int) -> dict[str, Any] | None:
+    """Fetch one pull request by number, independent of any closing-issue
+    relation (have-config#703)."""
+    owner, name = repository.split("/", 1)
+    response = GRAPHQL.request(
+        github.PULL_REQUEST_BY_NUMBER_QUERY,
+        strings={"owner": owner, "name": name},
+        integers={"number": int(pr_number)},
+    )
+    repository_data = response.get("data", {}).get("repository") \
+        if isinstance(response, dict) else None
+    pull_request = (
+        repository_data.get("pullRequest")
+        if isinstance(repository_data, dict) else None
+    )
+    return pull_request if isinstance(pull_request, dict) else None
+
+
+def explicit_release_pr(
+    repository: str,
+    issue_number: str,
+    pr_number: int,
+    branch: str,
+    *,
+    require_open: bool = True,
+) -> dict[str, Any]:
+    """Resolve and fail-closed validate an explicit `release --pr N` binding."""
+    pull_request = fetch_pull_request_node(repository, pr_number)
+    # The claim's own `branch` field is self-reported at claim time and is
+    # not proof of ownership by itself; require the PR's actual,
+    # GitHub-verified author to match the actor authenticated right now
+    # before trusting the branch as a session-binding signal (have-config#703).
+    actor_data = command_json(["gh", "api", "user"])
+    actor = str(actor_data.get("login") or "") if isinstance(actor_data, dict) else ""
+    error = lifecycle.explicit_release_pr_error(
+        pull_request,
+        repository=repository,
+        issue_number=str(issue_number),
+        branch=branch,
+        actor=actor,
+        require_open=require_open,
+    )
+    if error:
+        raise RuntimeError(error)
+    assert pull_request is not None
+    return pull_request
+
+
 def linked_closing_prs(
     repository: str,
     issue_number: str,
@@ -335,6 +387,7 @@ def linked_closing_prs(
     key = (repository, str(issue_number))
     if not refresh and key in _LINKED_CLOSING_CACHE:
         return _LINKED_CLOSING_CACHE[key]
+    explicit = _EXPLICIT_RELEASE_PR.get(key)
     owner, name = repository.split("/", 1)
     pages: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -362,6 +415,19 @@ def linked_closing_prs(
     else:
         raise RuntimeError("closing pull-request relation exceeded 20 pages")
     result = lifecycle.closing_pull_requests(pages)
+    if explicit is not None:
+        pr_number, branch, require_open = explicit
+        # Always resolve and validate the explicit binding directly, even
+        # when GitHub's own relation already happens to include this PR
+        # number: the relation alone does not prove branch/author ownership,
+        # which is what --pr additionally promises (have-config#703).
+        explicit_pr = explicit_release_pr(
+            repository, issue_number, pr_number, branch, require_open=require_open,
+        )
+        result = sorted(
+            [pr for pr in result if pr.get("number") != pr_number] + [explicit_pr],
+            key=lambda pr: pr["number"],
+        )
     _LINKED_CLOSING_CACHE[key] = result
     return result
 
@@ -2096,8 +2162,41 @@ def release_issue(args: argparse.Namespace) -> int:
         args.session,
         getattr(args, "claim_comment_id", None),
     )
-    reason = "abandoned" if args.abandon else "blocked" if args.blocked else "review"
     was_released = bool(payload.get("released_at"))
+    pr_binding = getattr(args, "pr", None)
+    if pr_binding is not None:
+        if args.abandon:
+            raise RuntimeError("--pr requires releasing to review or blocked, not --abandon")
+        branch = str(payload.get("branch") or "")
+        if not branch:
+            raise RuntimeError("--pr requires a claim recorded with --branch")
+        stored_binding = payload.get("release_pr_binding")
+        if stored_binding is not None and int(stored_binding) != int(pr_binding):
+            raise RuntimeError(
+                f"claim was already bound to PR #{stored_binding}, not #{pr_binding}; "
+                "reacquire and release a new claim cycle to bind a different pull request"
+            )
+        if was_released and stored_binding is None:
+            # Never backfill evidence onto an already-released claim that was
+            # never PR-bound in the first place (kernel: never backfill a
+            # release). A genuinely new binding needs a fresh claim cycle.
+            raise RuntimeError(
+                "claim was already released without a recorded PR binding; "
+                "--pr cannot attach new evidence to a released claim "
+                "retroactively; reacquire and release a new claim cycle"
+            )
+        # A merged/closed PR may only be resumed from an already-persisted
+        # binding (post-release evidence recovery); the initial grant always
+        # requires an open PR.
+        _EXPLICIT_RELEASE_PR[(repository, str(number))] = (
+            int(pr_binding), branch, stored_binding is None,
+        )
+    elif payload.get("release_pr_binding") is not None:
+        _EXPLICIT_RELEASE_PR[(repository, str(number))] = (
+            int(payload["release_pr_binding"]), str(payload.get("branch") or ""),
+            False,
+        )
+    reason = "abandoned" if args.abandon else "blocked" if args.blocked else "review"
     existing_reason = payload.get("release_reason") if payload.get("released_at") else None
     closed_issue = issue_state(repository, number)
     close_lost = closed_issue.get("state") != "OPEN" and (
@@ -2210,6 +2309,8 @@ def release_issue(args: argparse.Namespace) -> int:
         payload["release_reason"] = reason
         if release_heads is not None:
             payload["release_pr_heads"] = release_heads
+        if pr_binding is not None:
+            payload["release_pr_binding"] = int(pr_binding)
         claim_changed = True
     closing_after_release: list[dict[str, Any]] | None = None
     evidence_linked = linked
@@ -2253,7 +2354,7 @@ def release_issue(args: argparse.Namespace) -> int:
             name: payload[name]
             for name in (
                 "release_message", "release_reason", "release_pr_heads",
-                "release_evidence_sha256", "released_at",
+                "release_pr_binding", "release_evidence_sha256", "released_at",
             )
             if name in payload
         }
@@ -3726,6 +3827,55 @@ def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
     errors.extend(lifecycle.closing_issue_reference_errors(pr, repository))
     default_branch = pr.get("baseRepositoryDefaultBranch")
     base_branch = pr.get("baseRefName")
+    linked_issues = [
+        lifecycle_issue_state(repository, str(link["number"]))
+        for link in links
+        if not lifecycle.closing_issue_reference_errors(
+            {"closingIssuesReferences": [link]}, repository,
+        )
+    ]
+    non_default_base = (
+        isinstance(default_branch, str) and isinstance(base_branch, str)
+        and default_branch and base_branch and base_branch != default_branch
+    )
+    confirmed_keyword_issues: set[str] = set()
+    if not linked_issues and non_default_base:
+        # GitHub never populates closingIssuesReferences for a non-default-base
+        # PR (have-config#703), and this fresh CI process has no in-memory
+        # _EXPLICIT_RELEASE_PR state from the release call that bound it
+        # (have-config#704). Fall back to the same authorization the release
+        # path already persisted: a same-repo closing keyword in the title or
+        # body, confirmed against the referenced issue's own canonical claim
+        # (release_pr_binding/release_pr_heads naming this exact PR and head).
+        pr_number = pr.get("number")
+        head_oid = str(pr.get("headRefOid") or "")
+        if isinstance(pr_number, int) and not isinstance(pr_number, bool) and head_oid:
+            for candidate in sorted(
+                lifecycle.keyword_linked_issue_numbers(pr, repository), key=int,
+            ):
+                try:
+                    candidate_issue = lifecycle_issue_state(repository, candidate)
+                except RuntimeError as exc:
+                    # A closing-keyword number that is not a readable issue
+                    # (a PR number, a deleted issue, a transient read
+                    # failure) must not abort the whole check-pr run and
+                    # drop every other collected error; record it and keep
+                    # evaluating the remaining candidates and checks.
+                    errors.append(
+                        f"issue #{candidate} closing keyword references PR "
+                        f"#{pr_number}, but its state could not be read "
+                        f"({exc}); bind it with `hv-agent release --pr` before "
+                        "it counts as a closing reference"
+                    )
+                    continue
+                binding_error = lifecycle.keyword_linked_issue_error(
+                    candidate_issue, pr_number, head_oid,
+                )
+                if binding_error:
+                    errors.append(binding_error)
+                else:
+                    linked_issues.append(candidate_issue)
+                    confirmed_keyword_issues.add(candidate)
     if not isinstance(default_branch, str) or not default_branch \
             or not isinstance(base_branch, str) or not base_branch:
         errors.append("PR base branch metadata is unavailable; reread GitHub before lifecycle validation")
@@ -3736,14 +3886,8 @@ def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
             pull_request_commits(repository, str(number)) if check_commit_references else [],
             repository,
             check_commit_references=check_commit_references,
+            confirmed_keyword_issues=confirmed_keyword_issues,
         ))
-    linked_issues = [
-        lifecycle_issue_state(repository, str(link["number"]))
-        for link in links
-        if not lifecycle.closing_issue_reference_errors(
-            {"closingIssuesReferences": [link]}, repository,
-        )
-    ]
     needs_release_evidence = any(
         issue.get("authorityMetadataComplete")
         and any(
@@ -3839,6 +3983,7 @@ def main() -> int:
     release_mode = release.add_mutually_exclusive_group()
     release_mode.add_argument("--blocked", action="store_true")
     release_mode.add_argument("--abandon", action="store_true")
+    release.add_argument("--pr", type=int)
     release.add_argument("--no-project", action="store_true")
     generated_recovery = commands.add_parser(
         "generated-transition-recover",

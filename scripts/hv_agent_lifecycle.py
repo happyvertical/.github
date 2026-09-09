@@ -2213,10 +2213,18 @@ def claim_payload_error(payload: dict[str, Any]) -> str | None:
             return "release_evidence_sha256 must be a lowercase SHA-256"
         if reason not in PR_BOUND_RELEASE_REASONS or not isinstance(heads, dict):
             return "release_evidence_sha256 requires a review or blocked PR release"
+    binding = payload.get("release_pr_binding")
+    if "release_pr_binding" in payload:
+        if not isinstance(binding, int) or isinstance(binding, bool) or binding < 1:
+            return "release_pr_binding must be a positive integer"
+        if reason not in PR_BOUND_RELEASE_REASONS:
+            return "release_pr_binding requires a review or blocked release_reason"
+        if isinstance(heads, dict) and str(binding) not in heads:
+            return "release_pr_binding must be one of the recorded release_pr_heads"
     if not payload.get("released_at") and any(
         name in payload for name in (
             "release_reason", "release_message", "release_pr_heads",
-            "release_evidence_sha256",
+            "release_pr_binding", "release_evidence_sha256",
         )
     ):
         return "release fields require released_at"
@@ -2681,6 +2689,92 @@ def closing_pull_requests(response: Any) -> list[dict[str, Any]]:
                 raise ValueError("closing pull-request query returned a malformed PR node")
             results[node["number"]] = node
     return [results[number] for number in sorted(results)]
+
+
+# GitHub's own closing-keyword vocabulary (close/closes/closed, fix/fixes/
+# fixed, resolve/resolves/resolved), matched against `#<issue number>` in
+# either order within a short span so "Closes #703" and "#703 fixed" both
+# qualify. Used only to validate an explicit `release --pr N` binding
+# (have-config#703); GitHub's own closingIssuesReferences graph is still the
+# source of truth whenever it is populated.
+CLOSING_KEYWORD_PATTERN = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*#{issue}\b"
+    .replace("{issue}", r"(?P<issue>\d+)"),
+    re.IGNORECASE,
+)
+
+
+def explicit_release_pr_error(
+    pull_request: dict[str, Any] | None,
+    *,
+    repository: str,
+    issue_number: str,
+    branch: str,
+    actor: str,
+    require_open: bool = True,
+) -> str | None:
+    """Fail-closed validation for an explicit `release --pr N` binding.
+
+    Returns a human-readable error, or None when the pull request may stand
+    in for GitHub's closingIssuesReferences relation (have-config#703).
+
+    `actor` must be the authenticated GitHub login making this release call
+    (e.g. from `gh api user`), never a client-supplied string: the claim's
+    own `branch` field is self-reported at claim time and is not proof of
+    ownership by itself (a public branch name can be discovered and reused
+    by any other claimant), so the pull request's actual, GitHub-verified
+    author must also match the caller before its branch is trusted as a
+    session-binding signal. `require_open` is False only when resolving an
+    already-persisted `release_pr_binding` for post-release evidence
+    recovery (a merged or closed PR must still be recoverable), never for
+    the initial `--pr` grant.
+    """
+    if not isinstance(pull_request, dict):
+        return "--pr pull request was not found"
+    number = pull_request.get("number")
+    pr_repository = pull_request.get("repository")
+    pr_repository_name = (
+        pr_repository.get("nameWithOwner")
+        if isinstance(pr_repository, dict) else None
+    )
+    if pr_repository_name != repository:
+        return f"--pr {number} is not a pull request on {repository}"
+    if require_open:
+        if pull_request.get("state") != "OPEN":
+            return f"--pr {number} is not open"
+    elif pull_request.get("state") not in {"OPEN", "CLOSED", "MERGED"}:
+        return f"--pr {number} has an unrecognized state"
+    if pull_request.get("isDraft"):
+        return f"--pr {number} is a draft; mark it ready for review first"
+    author = pull_request.get("author")
+    author_login = author.get("login") if isinstance(author, dict) else None
+    if not actor or not isinstance(author_login, str) or author_login != actor:
+        return (
+            f"--pr {number} author {author_login!r} does not match the "
+            f"authenticated actor {actor or 'unknown'!r}; only the pull "
+            "request's own author may bind it to a release"
+        )
+    head_ref = pull_request.get("headRefName")
+    if not isinstance(head_ref, str) or not branch or head_ref != branch:
+        return (
+            f"--pr {number} head branch {head_ref!r} does not match the "
+            f"claim's branch {branch!r}"
+        )
+    # Scan title and body independently, never joined: joining them with a
+    # separator lets a keyword ending one field and a bare "#N" starting the
+    # other combine into a synthetic closing reference that neither field
+    # actually contains (e.g. title "Deployment fixes" + body "#703
+    # documents ..." would otherwise read as "fixes #703").
+    if not any(
+        match.group("issue") == str(issue_number)
+        for field in ("title", "body")
+        for match in CLOSING_KEYWORD_PATTERN.finditer(str(pull_request.get(field) or ""))
+    ):
+        return (
+            f"--pr {number} does not reference #{issue_number} with a "
+            "closing keyword (Closes/Fixes/Resolves) in its title or body"
+        )
+    return None
 
 
 def release_pr_heads(pull_requests: list[dict[str, Any]]) -> dict[str, str]:
@@ -4108,12 +4202,73 @@ def closing_keyword_references(
     return references
 
 
+def keyword_linked_issue_numbers(pr: dict[str, Any], repository: str) -> set[str]:
+    """Same-repo issue numbers a closing keyword in the PR title/body names.
+
+    GitHub never populates `closingIssuesReferences` for a PR whose base is
+    not the repository default branch (have-config#703). `check-pr` uses this
+    as its candidate list before confirming each one through
+    `keyword_linked_issue_error`; scanned separately per field, exactly like
+    `explicit_release_pr_error`, so a keyword ending one field can never
+    combine with a bare `#N` starting the other into a synthetic reference
+    neither field actually contains.
+    """
+    numbers: set[str] = set()
+    for field, markdown in (("title", False), ("body", True)):
+        text = str(pr.get(field) or "")
+        for reference in closing_keyword_references(text, repository, markdown=markdown):
+            if reference.startswith("#"):
+                numbers.add(reference[1:])
+    return numbers
+
+
+def keyword_linked_issue_error(
+    issue: dict[str, Any],
+    pr_number: int,
+    pr_head_oid: str,
+) -> str | None:
+    """Fail-closed confirmation for a non-default-base closing-keyword link.
+
+    `check-pr` (have-config#704) runs in a fresh process with no in-memory
+    `_EXPLICIT_RELEASE_PR` state, so it cannot rely on that release-time cache
+    to stand in for GitHub's own `closingIssuesReferences`. Instead it
+    re-derives the same authorization the release path already persisted:
+    the referenced issue's own canonical claim history must carry a
+    `release_pr_binding`/`release_pr_heads` naming this exact PR number and
+    head. A bare closing-keyword mention with no such confirmed binding is
+    rejected rather than trusted, keeping the check fail-closed.
+    """
+    records, errors = claim_comment_records(issue)
+    if errors:
+        return (
+            f"issue #{issue_number(issue)} claim history could not be read while "
+            f"confirming its closing-keyword reference to PR #{pr_number}"
+        )
+    for pair in records:
+        if not claim_pair_current(pair):
+            continue
+        payload = pair[1]
+        binding = payload.get("release_pr_binding")
+        if not isinstance(binding, int) or isinstance(binding, bool) or binding != pr_number:
+            continue
+        heads = payload.get("release_pr_heads")
+        if isinstance(heads, dict) and heads.get(str(pr_number)) == pr_head_oid:
+            return None
+    return (
+        f"issue #{issue_number(issue)} closing keyword references PR #{pr_number}, but no "
+        f"current claim on that issue records a release_pr_binding/release_pr_heads pair "
+        f"confirming PR #{pr_number} at its exact head; bind it with `hv-agent release "
+        "--pr` before it counts as a closing reference"
+    )
+
+
 def undeclared_closing_reference_errors(
     pr: dict[str, Any],
     commits: list[dict[str, Any]],
     repository: str,
     *,
     check_commit_references: bool = True,
+    confirmed_keyword_issues: set[str] | None = None,
 ) -> list[str]:
     """Reject closing-keyword references the PR does not declare it closes.
 
@@ -4123,6 +4278,16 @@ def undeclared_closing_reference_errors(
     close on merge without the PR ever declaring it — and a sentence written to
     *disclaim* a closure is indistinguishable from one that intends it.
 
+    `confirmed_keyword_issues` extends the declared set with issue numbers
+    (bare, e.g. `"12"`) that `keyword_linked_issue_error` has already
+    confirmed through a same-repo closing keyword plus a matching
+    `release_pr_binding`/`release_pr_heads` on that exact PR and head
+    (have-config#703/#704, a non-default-base PR whose `closingIssuesReferences`
+    GitHub never populates). Without this, a genuinely bound non-default-base
+    reference would satisfy `validate_agent_pr`'s linked-issue check yet still
+    fail here as an "undeclared" closing keyword, since this function has no
+    other way to see the confirmed fallback link.
+
     Known limitation, stated rather than papered over: this reads the PR body
     and the branch's commit messages. It cannot read a squash message composed
     in the merge dialog, because that text does not exist until merge. It would
@@ -4130,6 +4295,7 @@ def undeclared_closing_reference_errors(
     from the branch.
     """
     declared = {f"#{issue_number(issue)}" for issue in pr.get("closingIssuesReferences", [])}
+    declared |= {f"#{number}" for number in (confirmed_keyword_issues or set())}
     sources: list[tuple[str, str, bool]] = [
         ("the PR body", str(pr.get("body") or ""), True),
     ]
