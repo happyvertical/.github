@@ -35,6 +35,18 @@ AGENT_POLICY_WORKFLOW_PATTERN = re.compile(
     r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml"
 )
 DEDICATED_LIFECYCLE_WORKFLOW = ".github/workflows/agent-policy.yml"
+INITIAL_BOOTSTRAP_AUTHORITY_PATHS = (
+    ".agents/project.yaml",
+    DEDICATED_LIFECYCLE_WORKFLOW,
+    ".github/agent-policy-lock.json",
+)
+INITIAL_BOOTSTRAP_AUTHORITY_ANCESTORS = frozenset({
+    ".agents",
+    ".github",
+    ".github/workflows",
+})
+INITIAL_BOOTSTRAP_SELECTOR = "hv-agent:initial-bootstrap"
+INITIAL_BOOTSTRAP_RECEIPT_PATTERN = re.compile(r"hv-agent/policy-bootstrap/[a-f0-9]{64}")
 
 PROJECT_METADATA_ORGANIZATION_QUERY = """\
 query($owner:String!,$number:Int!,$endCursor:String){
@@ -938,6 +950,137 @@ def _migration_bootstrap_selector(
         return None
 
 
+def initial_bootstrap_validation_evidence(
+    run_json: JsonRunner,
+    repository: str,
+    pull_request: dict[str, Any],
+    canonical_lifecycle: Callable[[dict[str, Any]], bytes] | None,
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """Accept only a fully absent base with a canonical bootstrap head.
+
+    The signed Ship bootstrap preflight separately authenticates this same
+    absence and records a receipt before release.  Lifecycle still has to
+    evaluate the PR body after ordinary lifecycle-only events, though, and an
+    initial consumer cannot supply the base manifest that ordinary validation
+    evidence reads.  Do not treat a partial base or an unreadable head as an
+    initial bootstrap.
+    """
+    if canonical_lifecycle is None:
+        return None
+    base_oid = str(pull_request.get("baseRefOid") or "")
+    head_oid = str(pull_request.get("headRefOid") or "")
+    number = pull_request.get("number")
+    if not lifecycle.GIT_OID_PATTERN.fullmatch(base_oid) \
+            or not lifecycle.GIT_OID_PATTERN.fullmatch(head_oid) \
+            or isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        return None
+    try:
+        for path in INITIAL_BOOTSTRAP_AUTHORITY_PATHS:
+            try:
+                run_json([
+                    "gh", "api",
+                    f"repos/{repository}/contents/{path}?ref={quote(base_oid, safe='')}",
+                ])
+            except Exception as exc:
+                if "HTTP 404" in str(exc):
+                    continue
+                return None
+            return None
+        base_tree = run_json([
+            "gh", "api",
+            f"repos/{repository}/git/trees/{quote(base_oid, safe='')}?recursive=1",
+        ])
+        if not isinstance(base_tree, dict) or base_tree.get("truncated") is not False \
+                or not isinstance(base_tree.get("tree"), list):
+            return None
+        for entry in base_tree["tree"]:
+            if not isinstance(entry, dict):
+                return None
+            path = entry.get("path")
+            entry_type = entry.get("type")
+            if path in INITIAL_BOOTSTRAP_AUTHORITY_PATHS:
+                return None
+            if path in INITIAL_BOOTSTRAP_AUTHORITY_ANCESTORS and entry_type != "tree":
+                return None
+        manifest_text = _revision_text(
+            run_json, repository, ".agents/project.yaml", head_oid,
+        )
+        lifecycle_text = _revision_text(
+            run_json, repository, DEDICATED_LIFECYCLE_WORKFLOW, head_oid,
+        )
+        if manifest_text is None or lifecycle_text is None:
+            return None
+        manifest = json.loads(manifest_text)
+        if not isinstance(manifest, dict) \
+                or lifecycle_text.encode("utf-8") != canonical_lifecycle(manifest):
+            return None
+        pages = run_json([
+            "gh", "api", f"repos/{repository}/issues/{number}/timeline?per_page=100",
+            "-H", "Accept: application/vnd.github+json",
+            "--paginate", "--slurp",
+        ])
+        if not isinstance(pages, list):
+            return None
+        timeline = [event for page in pages for event in page] \
+            if pages and isinstance(pages[0], list) else pages
+        return (INITIAL_BOOTSTRAP_SELECTOR, timeline) \
+            if all(isinstance(event, dict) for event in timeline) else None
+    except Exception:
+        return None
+
+
+def initial_bootstrap_receipt_error(
+    run_json: JsonRunner, repository: str, pull_request: dict[str, Any],
+) -> str | None:
+    """Require a current-maintainer receipt for an initial bootstrap head."""
+    number = pull_request.get("number")
+    head_oid = str(pull_request.get("headRefOid") or "")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1 \
+            or not lifecycle.GIT_OID_PATTERN.fullmatch(head_oid):
+        return "initial bootstrap lacks a valid PR number or exact head for receipt verification"
+    try:
+        pages = run_json([
+            "gh", "api", f"repos/{repository}/commits/{head_oid}/statuses?per_page=100",
+            "--paginate", "--slurp",
+        ])
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            return "initial bootstrap receipt status evidence is unreadable"
+        seen_contexts: set[str] = set()
+        for status in (item for page in pages for item in page):
+            if not isinstance(status, dict) \
+                    or not INITIAL_BOOTSTRAP_RECEIPT_PATTERN.fullmatch(str(status.get("context") or "")):
+                continue
+            context = str(status["context"])
+            if context in seen_contexts:
+                continue
+            seen_contexts.add(context)
+            creator = status.get("creator")
+            if status.get("state") != "success" \
+                    or status.get("target_url") != f"https://github.com/{repository}/pull/{number}" \
+                    or not status.get("created_at") \
+                    or not isinstance(creator, dict):
+                continue
+            login, identifier = creator.get("login"), creator.get("id")
+            if creator.get("type") != "User" or not isinstance(login, str) \
+                    or not re.fullmatch(r"[A-Za-z0-9-]+", login) \
+                    or isinstance(identifier, bool) or not isinstance(identifier, int):
+                continue
+            permission = run_json([
+                "gh", "api", f"repos/{repository}/collaborators/{quote(login, safe='')}/permission",
+            ])
+            if not isinstance(permission, dict) \
+                    or permission.get("user", {}).get("id") != identifier \
+                    or (permission.get("permission") != "admin" and permission.get("role_name") != "maintain"):
+                continue
+            return None
+    except Exception:
+        return "initial bootstrap receipt status evidence is unreadable"
+    return (
+        "initial bootstrap requires an exact authenticated maintainer receipt; run "
+        "the signed Ship preflight with --authorize-bootstrap on the clean pushed PR"
+    )
+
+
 def validation_workflow_evidence(
     run_json: JsonRunner,
     error_type: ErrorType,
@@ -958,10 +1101,27 @@ def validation_workflow_evidence(
             "pull request lacks a valid number and current head/base revision pair; "
             "reread GitHub"
         )
-    raw = run_json([
-        "gh", "api",
-        f"repos/{repository}/contents/.agents/project.yaml?ref={quote(base_oid, safe='')}",
-    ])
+    try:
+        raw = run_json([
+            "gh", "api",
+            f"repos/{repository}/contents/.agents/project.yaml?ref={quote(base_oid, safe='')}",
+        ])
+    except Exception as exc:
+        bootstrap = initial_bootstrap_validation_evidence(
+            run_json, repository, pull_request, canonical_lifecycle,
+        ) if "HTTP 404" in str(exc) else None
+        if bootstrap is None:
+            raise error_type(
+                f"base revision {base_oid} lacks readable .agents/project.yaml policy; "
+                "an initial bootstrap requires every authority path to be absent and "
+                "a canonical head lifecycle"
+            ) from exc
+        print(
+            f"WARNING base revision {base_oid} has no authority files; accepting "
+            f"canonical initial-bootstrap head {head_oid}",
+            file=sys.stderr,
+        )
+        return bootstrap
     if not isinstance(raw, dict) or raw.get("encoding") != "base64" \
             or not isinstance(raw.get("content"), str):
         raise error_type(
