@@ -3789,7 +3789,9 @@ def audit_repository(repo: Path) -> list[str]:
     return errors
 
 
-def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
+def check_pr(
+    repo: Path, number: str, *, bootstrap_precheck: bool = False,
+) -> tuple[list[str], list[str]]:
     """Return this revision's rejections, and notes explaining which remedy fits."""
     errors = audit_repository(repo)
     notes: list[str] = []
@@ -3803,26 +3805,52 @@ def check_pr(repo: Path, number: str) -> tuple[list[str], list[str]]:
             f"repository {trusted_repository}; restore generated project policy"
         )
     pr = lifecycle_pull_request(repository, number)
-    if lifecycle.validation_workflow_evidence_required(
+    require_workflow_evidence = lifecycle.validation_workflow_evidence_required(
         os.environ.get("EVENT_NAME"), os.environ.get("EVENT_ACTION"),
-    ):
-        try:
-            workflow_path, timeline = github.validation_workflow_evidence(
-                command_json, RuntimeError, repository, pr,
-                require_selector=(
-                    os.environ.get("GITHUB_REPOSITORY_ID") == CONTROL_PLANE_REPOSITORY_ID
-                ),
-                canonical_lifecycle=expected_lifecycle_workflow,
-            )
-        except RuntimeError as exc:
-            errors.append(str(exc))
-        else:
-            if workflow_path:
-                error = lifecycle.validation_workflow_transition_error(
-                    pr, workflow_path, timeline,
+    )
+    try:
+        workflow_path, timeline = github.validation_workflow_evidence(
+            command_json, RuntimeError, repository, pr,
+            require_selector=(
+                os.environ.get("GITHUB_REPOSITORY_ID") == CONTROL_PLANE_REPOSITORY_ID
+            ),
+            canonical_lifecycle=expected_lifecycle_workflow,
+        )
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    else:
+        if workflow_path == github.INITIAL_BOOTSTRAP_SELECTOR:
+            try:
+                signed_manifest = load(artifact_root() / "policy-artifact.json")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                selected_lock, lock_error = None, f"signed policy artifact manifest is unreadable: {exc}"
+            else:
+                selected_lock, lock_error = github.initial_bootstrap_selected_lock(
+                    expected_artifact=os.environ.get("POLICY_ARTIFACT") or os.environ.get("HV_POLICY_ARTIFACT"),
+                    expected_manifest=signed_manifest,
                 )
-                if error:
-                    errors.append(error)
+            if lock_error:
+                errors.append(lock_error)
+            else:
+                try:
+                    snapshot = github.initial_bootstrap_snapshot(
+                        command_json, repository, pr, selected_lock, expected_lifecycle_workflow,
+                    )
+                except ValueError as exc:
+                    errors.append(str(exc))
+                else:
+                    if not bootstrap_precheck:
+                        receipt_error = github.initial_bootstrap_receipt_error(
+                            command_json, repository, snapshot,
+                        )
+                        if receipt_error:
+                            errors.append(receipt_error)
+        elif require_workflow_evidence and workflow_path:
+            error = lifecycle.validation_workflow_transition_error(
+                pr, workflow_path, timeline,
+            )
+            if error:
+                errors.append(error)
     links = pr.get("closingIssuesReferences", [])
     errors.extend(lifecycle.closing_issue_reference_errors(pr, repository))
     default_branch = pr.get("baseRepositoryDefaultBranch")
@@ -3956,6 +3984,9 @@ def main() -> int:
     check = commands.add_parser("check-pr")
     check.add_argument("number")
     check.add_argument("repo", nargs="?", default=".")
+    bootstrap_precheck = commands.add_parser("bootstrap-precheck")
+    bootstrap_precheck.add_argument("number")
+    bootstrap_precheck.add_argument("repo", nargs="?", default=".")
     claim = commands.add_parser("claim")
     claim.add_argument("issue", type=int)
     claim.add_argument("--repo-path", default=".")
@@ -4020,6 +4051,7 @@ def main() -> int:
             "heartbeat": "heartbeat",
             "release": "release",
             "check-pr": "check-pr",
+            "bootstrap-precheck": "check-pr",
         }.get(args.command_name)
         if args.command_name == "reconcile":
             budget_command = (
@@ -4047,7 +4079,10 @@ def main() -> int:
         repo = Path(args.repo).resolve()
         errors, notes = (
             (audit_repository(repo), [])
-            if args.command_name == "audit" else check_pr(repo, args.number)
+            if args.command_name == "audit" else check_pr(
+                repo, args.number,
+                bootstrap_precheck=args.command_name == "bootstrap-precheck",
+            )
         )
         for error in errors:
             print(f"ERROR {error}")
