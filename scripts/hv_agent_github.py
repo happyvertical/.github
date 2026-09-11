@@ -12,10 +12,13 @@ from __future__ import annotations
 import datetime as dt
 import base64
 import json
+import hashlib
+import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -950,21 +953,221 @@ def _migration_bootstrap_selector(
         return None
 
 
+def _bootstrap_lock_errors(lock: object) -> list[str]:
+    """Validate the signed-workflow lock shape before it binds a receipt."""
+    fields = {
+        "schema", "artifact", "generation", "policy_revision",
+        "source_commit", "source_tree_sha256",
+    }
+    if not isinstance(lock, dict) or set(lock) not in (fields, fields | {"rollout"}):
+        return ["selected policy lock has unexpected or missing fields"]
+    errors: list[str] = []
+    if lock.get("schema") != "hv-agent-policy-lock:v1":
+        errors.append("selected policy lock has an unsupported schema")
+    if not isinstance(lock.get("artifact"), str) or not re.fullmatch(
+        r"ghcr\.io/happyvertical/agent-policy@sha256:[0-9a-f]{64}", lock["artifact"],
+    ):
+        errors.append("selected policy lock is not an immutable HappyVertical policy digest")
+    if isinstance(lock.get("generation"), bool) or not isinstance(lock.get("generation"), int) \
+            or lock["generation"] < 1:
+        errors.append("selected policy lock has an invalid generation")
+    if not isinstance(lock.get("policy_revision"), str) or not lock["policy_revision"]:
+        errors.append("selected policy lock has an invalid policy revision")
+    if not isinstance(lock.get("source_commit"), str) \
+            or not lifecycle.GIT_OID_PATTERN.fullmatch(lock["source_commit"]):
+        errors.append("selected policy lock has an invalid source commit")
+    if not isinstance(lock.get("source_tree_sha256"), str) \
+            or not re.fullmatch(r"[a-f0-9]{64}", lock["source_tree_sha256"]):
+        errors.append("selected policy lock has an invalid source tree digest")
+    rollout = lock.get("rollout")
+    if rollout is not None and (
+        not isinstance(rollout, dict) or set(rollout) != {"kind", "consumer_migration_repository_ids"}
+        or rollout.get("kind") not in {"runtime-only", "bootstrap-substrate"}
+        or not isinstance(rollout.get("consumer_migration_repository_ids"), list)
+    ):
+        errors.append("selected policy lock has invalid rollout metadata")
+    return errors
+
+
+def initial_bootstrap_selected_lock(
+    *, expected_artifact: str | None = None, expected_manifest: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read only the lock selected by the protected workflow or Ship helper."""
+    raw_path = os.environ.get("HV_POLICY_LOCK")
+    if not raw_path:
+        return None, "initial bootstrap receipt verification requires the protected selected policy lock"
+    try:
+        lock = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"initial bootstrap selected policy lock is unreadable: {exc}"
+    errors = _bootstrap_lock_errors(lock)
+    if errors:
+        return None, "; ".join(errors)
+    if not expected_artifact:
+        return None, "initial bootstrap receipt verification requires the signed running policy artifact identity"
+    if lock.get("artifact") != expected_artifact:
+        return None, "selected policy lock does not match the signed running policy artifact"
+    if expected_manifest is not None:
+        for field in ("generation", "policy_revision", "source_commit", "source_tree_sha256", "rollout"):
+            if lock.get(field) != expected_manifest.get(field):
+                return None, f"selected policy lock {field} does not match the signed running artifact manifest"
+    return lock, None
+
+
+def _bootstrap_authority_files(
+    run_json: JsonRunner, repository: str, revision: str,
+) -> dict[str, bytes | None]:
+    """Read the exact authority blobs from one complete immutable Git tree."""
+    commit = run_json(["gh", "api", f"repos/{repository}/git/commits/{revision}"])
+    tree_sha = commit.get("tree", {}).get("sha") if isinstance(commit, dict) else None
+    if not isinstance(commit, dict) or commit.get("sha") != revision \
+            or not isinstance(tree_sha, str) or not lifecycle.GIT_OID_PATTERN.fullmatch(tree_sha):
+        raise ValueError("bootstrap commit does not bind an immutable Git tree")
+    tree = run_json([
+        "gh", "api", f"repos/{repository}/git/trees/{tree_sha}?recursive=1",
+    ])
+    entries = tree.get("tree") if isinstance(tree, dict) else None
+    if not isinstance(tree, dict) or tree.get("sha") != tree_sha \
+            or tree.get("truncated") is not False or not isinstance(entries, list):
+        raise ValueError("bootstrap requires a complete immutable Git tree")
+    paths: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) \
+                or entry["path"] in paths:
+            raise ValueError("bootstrap Git tree contains malformed or duplicate paths")
+        paths[entry["path"]] = entry
+    files: dict[str, bytes | None] = {}
+    for path in INITIAL_BOOTSTRAP_AUTHORITY_PATHS:
+        parts = PurePosixPath(path).parts
+        for index in range(1, len(parts)):
+            parent = paths.get("/".join(parts[:index]))
+            if parent is not None and (parent.get("type") != "tree" or parent.get("mode") != "040000"):
+                raise ValueError("bootstrap authority ancestor is not a regular Git directory")
+            if parent is None and path in paths:
+                raise ValueError("bootstrap Git tree is missing an authority ancestor")
+        entry = paths.get(path)
+        if entry is None:
+            files[path] = None
+            continue
+        oid = entry.get("sha")
+        if entry.get("mode") != "100644" or entry.get("type") != "blob" \
+                or not isinstance(oid, str) or not lifecycle.GIT_OID_PATTERN.fullmatch(oid):
+            raise ValueError(f"bootstrap requires a regular Git blob for {path}")
+        blob = run_json(["gh", "api", f"repos/{repository}/git/blobs/{oid}"])
+        try:
+            if not isinstance(blob, dict) or blob.get("sha") != oid \
+                    or blob.get("encoding") != "base64" or not isinstance(blob.get("content"), str):
+                raise ValueError("invalid Git blob")
+            content = base64.b64decode("".join(blob["content"].split()), validate=True)
+            if hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest() != oid:
+                raise ValueError("Git blob digest mismatch")
+        except ValueError as exc:
+            raise ValueError(f"bootstrap Git blob is invalid for {path}") from exc
+        files[path] = content
+    return files
+
+
+def initial_bootstrap_snapshot(
+    run_json: JsonRunner,
+    repository: str,
+    pull_request: dict[str, Any],
+    lock: dict[str, Any],
+    canonical_lifecycle: Callable[[dict[str, Any]], bytes] | None,
+) -> dict[str, Any]:
+    """Reconstruct Ship's exact signed bootstrap receipt snapshot.
+
+    `lock` is supplied only by the protected workflow's selected-lock file or
+    the signed Ship helper. Proposed repository files never choose it.
+    """
+    if canonical_lifecycle is None:
+        raise ValueError("bootstrap lacks a canonical lifecycle renderer")
+    lock_errors = _bootstrap_lock_errors(lock)
+    if lock_errors:
+        raise ValueError("; ".join(lock_errors))
+    number = pull_request.get("number")
+    base_oid = str(pull_request.get("baseRefOid") or "")
+    head_oid = str(pull_request.get("headRefOid") or "")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1 \
+            or not lifecycle.GIT_OID_PATTERN.fullmatch(base_oid) \
+            or not lifecycle.GIT_OID_PATTERN.fullmatch(head_oid):
+        raise ValueError("initial bootstrap lacks a valid PR number and exact base/head")
+    actual = run_json(["gh", "api", f"repos/{repository}"])
+    repository_id = actual.get("node_id") if isinstance(actual, dict) else None
+    branch = actual.get("default_branch") if isinstance(actual, dict) else None
+    if not isinstance(actual, dict) or actual.get("full_name") != repository \
+            or actual.get("fork") is not False or actual.get("id") in {1129270614, 1246847256} \
+            or repository in {"happyvertical/.github", "happyvertical/" + "have-config"} \
+            or not isinstance(repository_id, str) or not re.fullmatch(r"R_[A-Za-z0-9]+", repository_id) \
+            or not isinstance(branch, str) or not branch:
+        raise ValueError("bootstrap consumer repository identity is invalid or forked")
+    base_ref, head_ref = pull_request.get("base"), pull_request.get("head")
+    if pull_request.get("state") not in {"OPEN", "open"} or pull_request.get("isDraft") is True \
+            or pull_request.get("baseRefName") != branch \
+            or not isinstance(pull_request.get("headRefName"), str) or not pull_request["headRefName"] \
+            or not isinstance(base_ref, dict) or not isinstance(head_ref, dict) \
+            or any(not isinstance(ref.get("repo"), dict) or ref["repo"].get("node_id") != repository_id \
+                   or ref.get("sha") != expected_oid
+                   for ref, expected_oid in ((base_ref, base_oid), (head_ref, head_oid))):
+        raise ValueError("bootstrap requires an open same-repository PR against current protected default base")
+    protected = run_json([
+        "gh", "api", f"repos/{repository}/branches/{quote(branch, safe='')}",
+    ])
+    if not isinstance(protected, dict) or protected.get("protected") is not True \
+            or protected.get("commit", {}).get("sha") != base_oid:
+        raise ValueError("bootstrap requires an open same-repository PR against current protected default base")
+    base = _bootstrap_authority_files(run_json, repository, base_oid)
+    head = _bootstrap_authority_files(run_json, repository, head_oid)
+    if any(value is not None for value in base.values()):
+        raise ValueError("initial bootstrap requires all protected authority absent")
+    if head[".github/agent-policy-lock.json"] is not None \
+            or head[DEDICATED_LIFECYCLE_WORKFLOW] is None \
+            or head[".agents/project.yaml"] is None:
+        raise ValueError("bootstrap head requires workflow and manifest with no local lock")
+    try:
+        manifest = json.loads(head[".agents/project.yaml"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("bootstrap project manifest is invalid") from exc
+    policy = manifest.get("policy") if isinstance(manifest, dict) else None
+    forge = (manifest.get("forge") or manifest.get("tracker")) if isinstance(manifest, dict) else None
+    runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
+    if not isinstance(manifest, dict) \
+            or manifest.get("schema") != "https://happyvertical.com/schemas/agent-project/v1" \
+            or not isinstance(policy, dict) or policy.get("profile") != "happyvertical" \
+            or policy.get("revision") != lock.get("policy_revision") \
+            or not isinstance(forge, dict) or forge.get("provider", "github") != "github" \
+            or forge.get("repository") != repository \
+            or not isinstance(runtime, dict) \
+            or not all(key in runtime for key in ("agent_lifecycle_stage", "agent_policy_runner")):
+        raise ValueError("bootstrap manifest must explicitly bind repository, target policy, stage and runner")
+    if head[DEDICATED_LIFECYCLE_WORKFLOW] != canonical_lifecycle(manifest):
+        raise ValueError("bootstrap lifecycle differs from the canonical signed policy rendering")
+    return {
+        "schema": "hv-agent-consumer-bootstrap:v1",
+        "repository": repository,
+        "repository_id": repository_id,
+        "pr": number,
+        "base_branch": branch,
+        "head_branch": pull_request["headRefName"],
+        "base": base_oid,
+        "head": head_oid,
+        "target": lock,
+        "stage": runtime["agent_lifecycle_stage"],
+        "runner": runtime["agent_policy_runner"],
+        "base_authority": {path: None for path in base},
+        "head_authority": {
+            path: hashlib.sha256(content).hexdigest() if content is not None else None
+            for path, content in head.items()
+        },
+    }
+
+
 def initial_bootstrap_validation_evidence(
     run_json: JsonRunner,
     repository: str,
     pull_request: dict[str, Any],
     canonical_lifecycle: Callable[[dict[str, Any]], bytes] | None,
 ) -> tuple[str, list[dict[str, Any]]] | None:
-    """Accept only a fully absent base with a canonical bootstrap head.
-
-    The signed Ship bootstrap preflight separately authenticates this same
-    absence and records a receipt before release.  Lifecycle still has to
-    evaluate the PR body after ordinary lifecycle-only events, though, and an
-    initial consumer cannot supply the base manifest that ordinary validation
-    evidence reads.  Do not treat a partial base or an unreadable head as an
-    initial bootstrap.
-    """
+    """Identify an initial bootstrap before receipt-specific verification."""
     if canonical_lifecycle is None:
         return None
     base_oid = str(pull_request.get("baseRefOid") or "")
@@ -987,8 +1190,7 @@ def initial_bootstrap_validation_evidence(
                 return None
             return None
         base_tree = run_json([
-            "gh", "api",
-            f"repos/{repository}/git/trees/{quote(base_oid, safe='')}?recursive=1",
+            "gh", "api", f"repos/{repository}/git/trees/{quote(base_oid, safe='')}?recursive=1",
         ])
         if not isinstance(base_tree, dict) or base_tree.get("truncated") is not False \
                 or not isinstance(base_tree.get("tree"), list):
@@ -996,18 +1198,12 @@ def initial_bootstrap_validation_evidence(
         for entry in base_tree["tree"]:
             if not isinstance(entry, dict):
                 return None
-            path = entry.get("path")
-            entry_type = entry.get("type")
-            if path in INITIAL_BOOTSTRAP_AUTHORITY_PATHS:
+            path, entry_type = entry.get("path"), entry.get("type")
+            if path in INITIAL_BOOTSTRAP_AUTHORITY_PATHS \
+                    or path in INITIAL_BOOTSTRAP_AUTHORITY_ANCESTORS and entry_type != "tree":
                 return None
-            if path in INITIAL_BOOTSTRAP_AUTHORITY_ANCESTORS and entry_type != "tree":
-                return None
-        manifest_text = _revision_text(
-            run_json, repository, ".agents/project.yaml", head_oid,
-        )
-        lifecycle_text = _revision_text(
-            run_json, repository, DEDICATED_LIFECYCLE_WORKFLOW, head_oid,
-        )
+        manifest_text = _revision_text(run_json, repository, ".agents/project.yaml", head_oid)
+        lifecycle_text = _revision_text(run_json, repository, DEDICATED_LIFECYCLE_WORKFLOW, head_oid)
         if manifest_text is None or lifecycle_text is None:
             return None
         manifest = json.loads(manifest_text)
@@ -1016,28 +1212,28 @@ def initial_bootstrap_validation_evidence(
             return None
         pages = run_json([
             "gh", "api", f"repos/{repository}/issues/{number}/timeline?per_page=100",
-            "-H", "Accept: application/vnd.github+json",
-            "--paginate", "--slurp",
+            "-H", "Accept: application/vnd.github+json", "--paginate", "--slurp",
         ])
         if not isinstance(pages, list):
             return None
-        timeline = [event for page in pages for event in page] \
-            if pages and isinstance(pages[0], list) else pages
-        return (INITIAL_BOOTSTRAP_SELECTOR, timeline) \
-            if all(isinstance(event, dict) for event in timeline) else None
+        timeline = [event for page in pages for event in page] if pages and isinstance(pages[0], list) else pages
+        return (INITIAL_BOOTSTRAP_SELECTOR, timeline) if all(isinstance(event, dict) for event in timeline) else None
     except Exception:
         return None
 
 
 def initial_bootstrap_receipt_error(
-    run_json: JsonRunner, repository: str, pull_request: dict[str, Any],
+    run_json: JsonRunner, repository: str, snapshot: dict[str, Any],
 ) -> str | None:
-    """Require a current-maintainer receipt for an initial bootstrap head."""
-    number = pull_request.get("number")
-    head_oid = str(pull_request.get("headRefOid") or "")
+    """Require one current maintainer receipt for this full protected snapshot."""
+    number = snapshot.get("pr")
+    head_oid = str(snapshot.get("head") or "")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1 \
             or not lifecycle.GIT_OID_PATTERN.fullmatch(head_oid):
-        return "initial bootstrap lacks a valid PR number or exact head for receipt verification"
+        return "initial bootstrap lacks a valid exact snapshot for receipt verification"
+    expected_context = "hv-agent/policy-bootstrap/" + hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode(),
+    ).hexdigest()
     try:
         pages = run_json([
             "gh", "api", f"repos/{repository}/commits/{head_oid}/statuses?per_page=100",
@@ -1045,41 +1241,37 @@ def initial_bootstrap_receipt_error(
         ])
         if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
             return "initial bootstrap receipt status evidence is unreadable"
-        seen_contexts: set[str] = set()
-        for status in (item for page in pages for item in page):
-            if not isinstance(status, dict) \
-                    or not INITIAL_BOOTSTRAP_RECEIPT_PATTERN.fullmatch(str(status.get("context") or "")):
-                continue
-            context = str(status["context"])
-            if context in seen_contexts:
-                continue
-            seen_contexts.add(context)
+        matching = [
+            status for page in pages for status in page
+            if isinstance(status, dict) and status.get("context") == expected_context
+        ]
+        if matching:
+            # GitHub returns newest first: any latest non-success revokes this snapshot.
+            status = matching[0]
             creator = status.get("creator")
             if status.get("state") != "success" \
                     or status.get("target_url") != f"https://github.com/{repository}/pull/{number}" \
-                    or not status.get("created_at") \
-                    or not isinstance(creator, dict):
-                continue
+                    or not status.get("created_at") or not isinstance(creator, dict):
+                return "initial bootstrap receipt is revoked or malformed"
             login, identifier = creator.get("login"), creator.get("id")
             if creator.get("type") != "User" or not isinstance(login, str) \
                     or not re.fullmatch(r"[A-Za-z0-9-]+", login) \
                     or isinstance(identifier, bool) or not isinstance(identifier, int):
-                continue
+                return "initial bootstrap receipt is revoked or malformed"
             permission = run_json([
                 "gh", "api", f"repos/{repository}/collaborators/{quote(login, safe='')}/permission",
             ])
-            if not isinstance(permission, dict) \
-                    or permission.get("user", {}).get("id") != identifier \
-                    or (permission.get("permission") != "admin" and permission.get("role_name") != "maintain"):
-                continue
-            return None
+            if isinstance(permission, dict) and permission.get("user", {}).get("id") == identifier \
+                    and (permission.get("permission") == "admin" or permission.get("role_name") == "maintain"):
+                return None
+            return "initial bootstrap receipt is revoked or malformed"
     except Exception:
         return "initial bootstrap receipt status evidence is unreadable"
     return (
-        "initial bootstrap requires an exact authenticated maintainer receipt; run "
-        "the signed Ship preflight with --authorize-bootstrap on the clean pushed PR"
+        "initial bootstrap requires an exact authenticated maintainer receipt for the current "
+        "base, head, and selected policy target; run the signed Ship preflight with "
+        "--authorize-bootstrap on the clean pushed PR"
     )
-
 
 def validation_workflow_evidence(
     run_json: JsonRunner,
