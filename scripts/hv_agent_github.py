@@ -1097,7 +1097,7 @@ def initial_bootstrap_snapshot(
     if not isinstance(actual, dict) or actual.get("full_name") != repository \
             or actual.get("fork") is not False or actual.get("id") in {1129270614, 1246847256} \
             or repository in {"happyvertical/.github", "happyvertical/" + "have-config"} \
-            or not isinstance(repository_id, str) or not re.fullmatch(r"R_[A-Za-z0-9]+", repository_id) \
+            or not isinstance(repository_id, str) or not re.fullmatch(r"R_[A-Za-z0-9_-]+", repository_id) \
             or not isinstance(branch, str) or not branch:
         raise ValueError("bootstrap consumer repository identity is invalid or forked")
     base_ref, head_ref = pull_request.get("base"), pull_request.get("head")

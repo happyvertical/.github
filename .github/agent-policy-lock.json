@@ -1,12 +1,12 @@
 {
-  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:7d17cc52180fbdd7a37550e8ccbd4fd6db9229ae455dbd2588bf1d9a32e6ea5b",
-  "generation": 41,
+  "artifact": "ghcr.io/happyvertical/agent-policy@sha256:605faafa32e26a590046c9330e8a194cf06e32c29d39ea5483e00d91f85b4b86",
+  "generation": 42,
   "policy_revision": "1.0.0",
   "rollout": {
     "consumer_migration_repository_ids": [],
     "kind": "runtime-only"
   },
   "schema": "hv-agent-policy-lock:v1",
-  "source_commit": "882674740042c3a735c8d56acab86ef5bd5bca34",
-  "source_tree_sha256": "65bfb914ab0e539e4c44aa19de80ad3fecd648cd8cd7c3a28e333a4c8b7c2eea"
+  "source_commit": "6641d78b2109ca1201b559ff1b24555a5b71d513",
+  "source_tree_sha256": "2952394789fc9188e75eebb286997c5e9a6b79aa984091ec77755e92c0ee8805"
 }
