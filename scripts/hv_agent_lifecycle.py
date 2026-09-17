@@ -49,7 +49,7 @@ GIT_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 ROLLOUT_METADATA_GENERATION = 27
-REPOSITORY_NODE_ID_PATTERN = re.compile(r"R_[A-Za-z0-9]+")
+REPOSITORY_NODE_ID_PATTERN = re.compile(r"R_[A-Za-z0-9_-]+")
 AUTHORITY_SUBSTRATE_PREDECESSOR_SCHEMA = "hv-agent-authority-substrate-predecessor:v1"
 AUTHORITY_SUBSTRATE_PREDECESSOR_FIELDS = {
     "schema", "generation", "source_commit", "components",
