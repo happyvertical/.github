@@ -30,11 +30,13 @@ control-plane repository.
 
 - `dispatch:<runtime>` labels trigger automation; only `agent: implementation`
   indicates exclusive active work.
-- Reusable implementation workflows must claim before editing, heartbeat during
-  work, create agent-run metadata, and release when the PR becomes ready.
+- Reusable implementation workflows must claim before editing and hand the
+  claim off when the PR becomes ready or the run stops. A claim is the
+  `agent: implementation` label plus one `<!-- hv-claim -->` comment the same
+  run edits in place; there are no leases or heartbeats.
 - Workflows never merge agent PRs. Do not add auto-merge behavior here.
-- Pin external actions and the public policy artifact immutably. Never expose
-  private fleet data or credentials in a public artifact.
+- Pin external actions immutably. Never expose private fleet data or
+  credentials in this public repository.
 - Avoid hard-coded package-manager versions; derive them from repository
   metadata or use the repository's declared toolchain.
 - Validate workflow syntax with `actionlint` and keep templates aligned with
