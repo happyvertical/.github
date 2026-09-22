@@ -36,7 +36,6 @@ In your repository settings (Settings → Secrets and variables → Actions → 
 | `PROJECT_ID` | GitHub Projects board ID | `PVT_kwDOB9Y8ns4A8-TY` |
 | `STATUS_FIELD_ID` | Status field ID | `PVTSSF_...` |
 | `STATUS_*_ID` | Status option IDs | See your project settings |
-| `AGENT_POLICY_ARTIFACT` | Signed public policy OCI digest | `ghcr.io/.../agent-policy@sha256:...` |
 
 The organization-level `CI_LINUX_RUNNER` variable selects the general Linux CI
 pool for centrally managed reusable workflows. It defaults to
@@ -126,10 +125,19 @@ Full **autonomous implementation** triggered by `dispatch: claude`:
 
 If Claude is blocked (unclear requirements, needs decisions), it posts a comment asking for clarification and removes the label. Re-apply the label once clarified.
 
-This workflow requires `AGENT_POLICY_ARTIFACT` to be set and a `GH_TOKEN` secret
-carrying org Projects v2 scope. It exits non-zero without the former, and its
-claim/heartbeat/release steps cannot write project state with the default
-`GITHUB_TOKEN`. See `.github/workflow-templates/claude-autopilot.yml`.
+Ownership is plain GitHub state. Before implementing, the workflow adds the
+`agent: implementation` label and posts one `<!-- hv-claim -->` claim comment
+naming its runtime, session and branch; when it finishes it edits that same
+comment to `**Status:** review — PR #N` (or `**Status:** blocked — …` on
+failure) and removes the label. There are no leases, no expiry and nothing to
+renew, so the workflow has no heartbeat and needs no policy artifact. It stands
+down without touching an issue another session holds — a claim comment, new
+marker or legacy `hv-agent-claim:v1`, with activity in the last 24 hours — and
+marks an older, stale one `superseded` before taking over.
+
+It needs a `GH_TOKEN` secret with repo write: a PR pushed with the default
+`GITHUB_TOKEN` does not trigger the downstream workflow runs the resulting PR
+has to pass. See `.github/workflow-templates/claude-autopilot.yml`.
 
 Because it is reachable only through `workflow_call`, `org-agent-autopilot-smoke.yml`
 invokes it against a **closed** issue so the call contract, input and secret
@@ -229,7 +237,7 @@ The workflows integrate with GitHub Projects:
 | Backlog | Triage complete |
 | Planning | Manual move |
 | Ready | Definition of Ready met |
-| In Progress | active `hv-agent-claim:v1` lease or manual |
+| In Progress | active `agent: implementation` claim or manual |
 | Review | PR created |
 | Done | PR merged or issue closed |
 

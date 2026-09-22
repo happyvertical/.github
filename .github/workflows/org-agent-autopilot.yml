@@ -36,7 +36,7 @@ on:
         type: string
         default: ''
       policy_artifact:
-        description: 'Immutable public policy artifact (OCI reference with @sha256 digest)'
+        description: 'Deprecated policy OCI digest; ignored since claims moved to plain GitHub state'
         required: false
         type: string
         default: ''
@@ -85,73 +85,106 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_TOKEN }}
 
-      - name: Install OCI client
-        if: steps.check.outputs.skip != 'true'
-        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
-
-      - name: Load pinned policy runtime
-        if: steps.check.outputs.skip != 'true'
-        env:
-          POLICY_ARTIFACT: ${{ inputs.policy_artifact || vars.AGENT_POLICY_ARTIFACT }}
-        run: |
-          case "$POLICY_ARTIFACT" in
-            ghcr.io/*@sha256:*) ;;
-            *) echo 'policy_artifact must be an immutable GHCR digest' >&2; exit 1 ;;
-          esac
-          policy_dir="$RUNNER_TEMP/hv-policy"
-          rm -rf "$policy_dir"
-          mkdir -p "$policy_dir"
-          oras pull "$POLICY_ARTIFACT" -o "$policy_dir"
-          tar -xzf "$policy_dir/agent-policy.tar.gz" -C "$policy_dir"
-          echo "HV_POLICY_DIR=$policy_dir" >> "$GITHUB_ENV"
-
+      # A claim is plain GitHub state: the `agent: implementation` label plus one
+      # `<!-- hv-claim -->` comment that later steps edit in place. There are no
+      # leases, no expiry and nothing to renew, so this step never runs a claim
+      # binary and the job has no heartbeat.
       - name: Claim implementation
         if: steps.check.outputs.skip != 'true'
         id: claim
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
-        run: |
-          python3 "$HV_POLICY_DIR/scripts/hv-agent" claim '${{ inputs.issue_number }}' \
-            --runtime claude \
-            --owner github-actions \
-            --session "$SESSION_ID" \
-            --branch 'agent/issue-${{ inputs.issue_number }}' \
-            --worktree "$GITHUB_WORKSPACE"
-
-      - name: Start implementation heartbeat
-        if: steps.claim.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RUN_ID: ${{ github.run_id }}
+          SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+          BRANCH: agent/issue-${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLAIM_LABEL: 'agent: implementation'
         run: |
-          (
-            while sleep 1800; do
-              python3 "$HV_POLICY_DIR/scripts/hv-agent" heartbeat "$ISSUE_NUMBER" \
-                --session "$SESSION_ID"
-            done
-          ) >"$RUNNER_TEMP/hv-agent-heartbeat.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/hv-agent-heartbeat.pid"
+          set -euo pipefail
+          claim_date="$(date -u +%F)"
+          echo "date=$claim_date" >> "$GITHUB_OUTPUT"
+
+          # Newest claim comment on the issue, new marker or legacy lease alike:
+          # id, last edit, whether it is still held, and whether this run wrote it.
+          prior="$(gh api --paginate "repos/$GH_REPO/issues/$ISSUE_NUMBER/comments?per_page=100" --jq '
+            .[]
+            | select(.body | test("<!-- hv-claim -->|hv-agent-claim:v1"))
+            | [ (.id | tostring),
+                .updated_at,
+                (if (.body | test("\\*\\*Status:\\*\\*[ ]*(review|blocked|abandoned|withdrawn|superseded)"; "i"))
+                    or (.body | test("released_at"))
+                 then "done" else "held" end),
+                (if (.body | test("github-actions:" + env.RUN_ID + ":")) then "mine" else "other" end) ]
+            | @tsv' | tail -n 1)"
+
+          prior_id=""; prior_updated=""; prior_state=""; prior_owner=""
+          if [ -n "$prior" ]; then
+            IFS=$'\t' read -r prior_id prior_updated prior_state prior_owner <<<"$prior" || true
+          fi
+
+          labels="$(gh issue view "$ISSUE_NUMBER" --repo "$GH_REPO" --json labels --jq '.labels[].name')"
+          has_label=false
+          if printf '%s\n' "$labels" | grep -Fxq "$CLAIM_LABEL"; then
+            has_label=true
+          fi
+
+          comment_id=""
+          if [ "$prior_owner" = "mine" ]; then
+            # Re-run of this same workflow run: keep the comment it already posted.
+            comment_id="$prior_id"
+          elif [ "$prior_state" = "held" ]; then
+            age=$(( $(date -u +%s) - $(date -u -d "$prior_updated" +%s) ))
+            if [ "$has_label" = true ] && [ "$age" -lt 86400 ]; then
+              echo "::warning::#$ISSUE_NUMBER is held by another session (comment $prior_id, updated $prior_updated)"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "Autopilot stood down: this issue already carries an active \`$CLAIM_LABEL\` claim (comment ${prior_id}, last updated ${prior_updated}). Hand that claim off, then re-apply \`dispatch: claude\`."
+              echo "claimed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Stale claim (no activity for 24h): take it over in the open by
+            # marking the prior comment superseded. Claim history is never deleted.
+            prior_body="$RUNNER_TEMP/prior-claim.md"
+            gh api "repos/$GH_REPO/issues/comments/$prior_id" --jq '.body' > "$prior_body"
+            printf "\n\n**Status:** superseded — stale claim taken over by hosted autopilot session \`%s\` on %s\n" \
+              "$SESSION_ID" "$claim_date" >> "$prior_body"
+            gh api "repos/$GH_REPO/issues/comments/$prior_id" -X PATCH -F "body=@$prior_body"
+          fi
+
+          claim_body="$(printf "<!-- hv-claim -->\nClaimed by **claude** · session \`%s\` · branch \`%s\` · %s\n\nHosted autopilot run: %s\n" \
+            "$SESSION_ID" "$BRANCH" "$claim_date" "$RUN_URL")"
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$GH_REPO" --add-label "$CLAIM_LABEL"
+
+          if [ -n "$comment_id" ]; then
+            # Re-run of this run: refresh its comment instead of stacking a second one.
+            gh api "repos/$GH_REPO/issues/comments/$comment_id" -X PATCH -f "body=$claim_body"
+          else
+            url="$(gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "$claim_body")"
+            comment_id="${url##*-}"
+          fi
+
+          echo "comment_id=$comment_id" >> "$GITHUB_OUTPUT"
+          echo "claimed=true" >> "$GITHUB_OUTPUT"
 
       - name: Configure Git
-        if: steps.check.outputs.skip != 'true'
+        if: steps.claim.outputs.claimed == 'true'
         run: |
           git config user.name "claude[bot]"
           git config user.email "claude[bot]@users.noreply.github.com"
 
       - name: Setup Node.js
-        if: steps.check.outputs.skip != 'true'
+        if: steps.claim.outputs.claimed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
       - name: Setup pnpm
-        if: steps.check.outputs.skip != 'true'
+        if: steps.claim.outputs.claimed == 'true'
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
-        if: steps.check.outputs.skip != 'true'
+        if: steps.claim.outputs.claimed == 'true'
         run: |
           if [ -f "pnpm-lock.yaml" ]; then
             pnpm install --frozen-lockfile
@@ -163,7 +196,7 @@ jobs:
         continue-on-error: true
 
       - name: Run Claude Implementation
-        if: steps.check.outputs.skip != 'true'
+        if: steps.claim.outputs.claimed == 'true'
         id: implement
         uses: anthropics/claude-code-action@v1
         with:
@@ -174,6 +207,11 @@ jobs:
             ISSUE_NUMBER: ${{ inputs.issue_number }}
 
             You are implementing issue #${{ inputs.issue_number }} autonomously.
+
+            The issue is already claimed for you: it carries the
+            `agent: implementation` label and a `<!-- hv-claim -->` comment for this
+            run. Do not post another claim comment and do not remove that label;
+            the workflow hands the claim off after you finish.
 
             ## Workflow
 
@@ -186,11 +224,10 @@ jobs:
             7. **Commit**: `git commit -m "feat(scope): description\n\nCloses #${{ inputs.issue_number }}"`
             8. **Push**: `git push -u origin [branch]`
             9. **Create a draft PR while implementing**, closing issue #${{ inputs.issue_number }}.
-               Include this metadata in the body with the actual validation commands:
-               `<!-- hv-agent-run:v1 -->`
-               `{"schema":"hv-agent-run:v1","runtime":"claude","session":"github-actions:${{ github.run_id }}:${{ github.run_attempt }}","issue":"${{ github.repository }}#${{ inputs.issue_number }}","policy_revision":"1.0.0","validation":["..."]}`
+               List the validation commands you actually ran in the body.
 
-            Do not merge. The workflow will release the claim and mark the PR ready.
+            Do not merge. The workflow marks the PR ready for review and hands the
+            claim off to review when you finish.
 
             ## If Blocked
 
@@ -207,25 +244,28 @@ jobs:
           claude_args: |
             --allowedTools Bash(git:*),Bash(gh pr:*),Bash(gh issue:*),Bash(pnpm:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Read,Write,Edit,Glob,Grep,Bash(ls:*),Bash(cat:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(rm:*)
 
-      - name: Stop implementation heartbeat
-        if: always() && steps.claim.outcome == 'success'
-        run: |
-          if [ -f "$RUNNER_TEMP/hv-agent-heartbeat.pid" ]; then
-            kill "$(cat "$RUNNER_TEMP/hv-agent-heartbeat.pid")" 2>/dev/null || true
-          fi
-
-      - name: Release completed implementation
-        if: success() && steps.check.outputs.skip != 'true'
+      - name: Hand off claim to review
+        if: success() && steps.claim.outputs.claimed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
+          CLAIM_DATE: ${{ steps.claim.outputs.date }}
           SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+          BRANCH: agent/issue-${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLAIM_LABEL: 'agent: implementation'
         run: |
-          pr_number=$(gh pr list --state open --json number,closingIssuesReferences \
-            --jq 'map(select(any(.closingIssuesReferences[]?; .number == ${{ inputs.issue_number }}))) | first | .number // empty')
+          set -euo pipefail
+          pr_number=$(gh pr list --repo "$GH_REPO" --state open --json number,closingIssuesReferences \
+            --jq "map(select(any(.closingIssuesReferences[]?; .number == $ISSUE_NUMBER))) | first | .number // empty")
           test -n "$pr_number" || { echo 'implementation completed without a linked PR' >&2; exit 1; }
-          python3 "$HV_POLICY_DIR/scripts/hv-agent" release '${{ inputs.issue_number }}' \
-            --session "$SESSION_ID" \
-            --message "Implementation complete in PR #$pr_number; ready for review."
+          gh pr ready "$pr_number" --repo "$GH_REPO" || true
+          body="$(printf "<!-- hv-claim -->\nClaimed by **claude** · session \`%s\` · branch \`%s\` · %s\n\nHosted autopilot run: %s\n\n**Status:** review — PR #%s\n" \
+            "$SESSION_ID" "$BRANCH" "$CLAIM_DATE" "$RUN_URL" "$pr_number")"
+          gh api "repos/$GH_REPO/issues/comments/$COMMENT_ID" -X PATCH -f "body=$body"
+          gh issue edit "$ISSUE_NUMBER" --repo "$GH_REPO" --remove-label "$CLAIM_LABEL"
 
       - name: Post Failure Comment
         if: failure() && steps.check.outputs.skip != 'true'
@@ -243,13 +283,23 @@ jobs:
           ---
           *Automated implementation by Claude*"
 
-      - name: Release blocked implementation
-        if: failure() && steps.claim.outcome == 'success'
+      - name: Hand off claim as blocked
+        if: failure() && steps.claim.outputs.claimed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          COMMENT_ID: ${{ steps.claim.outputs.comment_id }}
+          CLAIM_DATE: ${{ steps.claim.outputs.date }}
           SESSION_ID: github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+          BRANCH: agent/issue-${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLAIM_LABEL: 'agent: implementation'
         run: |
-          python3 "$HV_POLICY_DIR/scripts/hv-agent" release '${{ inputs.issue_number }}' \
-            --session "$SESSION_ID" \
-            --blocked \
-            --message "Hosted implementation stopped. Review the workflow log and resume from the smallest failing step."
+          set -euo pipefail
+          body="$(printf "<!-- hv-claim -->\nClaimed by **claude** · session \`%s\` · branch \`%s\` · %s\n\nHosted autopilot run: %s\n\n**Status:** blocked — hosted implementation stopped; next: review the workflow log and resume from the smallest failing step.\n" \
+            "$SESSION_ID" "$BRANCH" "$CLAIM_DATE" "$RUN_URL")"
+          gh api "repos/$GH_REPO/issues/comments/$COMMENT_ID" -X PATCH -f "body=$body"
+          gh issue edit "$ISSUE_NUMBER" --repo "$GH_REPO" --remove-label "$CLAIM_LABEL"
+          gh issue edit "$ISSUE_NUMBER" --repo "$GH_REPO" --add-label 'status: blocked' \
+            || echo "::warning::could not add 'status: blocked' to #$ISSUE_NUMBER"

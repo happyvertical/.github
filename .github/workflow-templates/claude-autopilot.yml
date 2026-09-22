@@ -4,19 +4,16 @@
 #
 # Required org secrets:
 #   - CLAUDE_CODE_OAUTH_TOKEN: Claude Code Max OAuth token.
-#   - GH_TOKEN: token carrying repo write plus org Projects v2 scope.
-#     The default GITHUB_TOKEN is not sufficient here. The autopilot's claim,
-#     heartbeat and release steps write org project items, which GITHUB_TOKEN
-#     cannot do, and a PR pushed with GITHUB_TOKEN does not trigger the
+#   - GH_TOKEN: token carrying repo write. The default GITHUB_TOKEN is not
+#     sufficient here: a PR pushed with GITHUB_TOKEN does not trigger the
 #     downstream workflow runs the resulting PR has to pass.
 #
-# Required variable (repository or org):
-#   - AGENT_POLICY_ARTIFACT: immutable policy digest, ghcr.io/...@sha256:...
-#     The reusable workflow exits non-zero when this is empty, so the autopilot
-#     cannot run without it.
+# No policy artifact is needed. The autopilot claims the issue with plain
+# GitHub state - the `agent: implementation` label plus one `<!-- hv-claim -->`
+# comment it edits in place when it hands off.
 #
-# The project_id / status_*_id inputs on the reusable workflow are deprecated
-# and are intentionally not passed here.
+# The policy_artifact / project_id / status_*_id inputs on the reusable
+# workflow are deprecated and are intentionally not passed here.
 
 name: Label Changed
 
@@ -40,7 +37,6 @@ jobs:
       issue_number: ${{ github.event.issue.number }}
       action: ${{ github.event.action }}
       label_name: ${{ github.event.label.name }}
-      policy_artifact: ${{ vars.AGENT_POLICY_ARTIFACT }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
