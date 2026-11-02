@@ -17,7 +17,8 @@ runs:
       id: lion
       shell: bash
       run: |
-        # Never fail the job: no `set -e`, every path ends in `exit 0`.
+        # Never fail the job: every command below runs in a `||` context (so the
+        # runner's `bash -e` does not apply) and the step always ends in `exit 0`.
         # The runner provider injects HV_BUILDKIT_HOST and HV_BUILDKIT_TLS_DIR
         # on Patdown runners only. They are process environment, which the
         # `env` expression context does not include, so read them here.
@@ -27,7 +28,10 @@ runs:
           [ -n "$endpoint" ] && [ -n "$tls" ] || return 0
           local f
           for f in ca.pem cert.pem key.pem; do
-            [ -r "$tls/$f" ] && [ -s "$tls/$f" ] || return 0
+            if ! [ -r "$tls/$f" ] || ! [ -s "$tls/$f" ]; then
+              echo "lion-buildx: falling back to the local builder ($f missing or unreadable)"
+              return 0
+            fi
           done
 
           local address="${endpoint#tcp://}"
@@ -36,7 +40,7 @@ runs:
 
           fallback() {
             echo "lion-buildx: falling back to the local builder ($1)"
-            docker buildx rm --force "$name" >/dev/null 2>&1
+            timeout 10 docker buildx rm --force "$name" >/dev/null 2>&1
             return 0
           }
 
@@ -49,17 +53,18 @@ runs:
           timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1 \
             || { fallback "endpoint did not answer within 5s"; return 0; }
 
-          timeout 30 docker buildx create --name "$name" --driver remote \
+          local err
+          err=$(timeout 30 docker buildx create --name "$name" --driver remote \
             --driver-opt "cacert=$tls/ca.pem,cert=$tls/cert.pem,key=$tls/key.pem" \
-            "$endpoint" >/dev/null 2>&1 \
-            || { fallback "could not create the remote builder"; return 0; }
+            "$endpoint" 2>&1 >/dev/null) \
+            || { fallback "could not create the remote builder: ${err##*$'\n'}"; return 0; }
 
           # Proves the mTLS handshake and a live worker before anything depends on it.
-          timeout 30 docker buildx inspect --bootstrap "$name" >/dev/null 2>&1 \
-            || { fallback "remote builder did not bootstrap"; return 0; }
+          err=$(timeout 30 docker buildx inspect --bootstrap "$name" 2>&1 >/dev/null) \
+            || { fallback "remote builder did not bootstrap: ${err##*$'\n'}"; return 0; }
 
-          timeout 15 docker buildx use "$name" >/dev/null 2>&1 \
-            || { fallback "could not select the remote builder"; return 0; }
+          err=$(timeout 15 docker buildx use "$name" 2>&1 >/dev/null) \
+            || { fallback "could not select the remote builder: ${err##*$'\n'}"; return 0; }
 
           echo "builder=$name" >> "$GITHUB_OUTPUT"
           echo "lion-buildx: using lion's BuildKit at $endpoint (builder $name)"
