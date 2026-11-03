@@ -10,6 +10,12 @@ outputs:
       the local builder is in use. Pass it to docker/build-push-action `builder`
       and skip docker/setup-buildx-action when it is non-empty.
     value: ${{ steps.lion.outputs.builder }}
+  remote:
+    description: >-
+      'true' when lion's remote BuildKit is the default builder, otherwise
+      'false'. Use it to skip work that only helps a local builder, such as
+      uploading the GitHub Actions build cache.
+    value: ${{ steps.lion.outputs.builder != '' && 'true' || 'false' }}
 runs:
   using: composite
   steps:
