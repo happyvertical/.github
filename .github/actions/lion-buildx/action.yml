@@ -1,0 +1,74 @@
+name: Lion BuildKit builder
+description: >-
+  Use lion's remote BuildKit as the default buildx builder when this job runs
+  on a Patdown runner and lion answers. Otherwise do nothing and leave the
+  default local builder alone. Never fails the job.
+outputs:
+  builder:
+    description: >-
+      Name of the remote buildx builder that is now the default, or empty when
+      the local builder is in use. Pass it to docker/build-push-action `builder`
+      and skip docker/setup-buildx-action when it is non-empty.
+    value: ${{ steps.lion.outputs.builder }}
+runs:
+  using: composite
+  steps:
+    - name: Probe lion's BuildKit and create the remote builder
+      id: lion
+      shell: bash
+      run: |
+        # Never fail the job: every command below runs in a `||` context (so the
+        # runner's `bash -e` does not apply) and the step always ends in `exit 0`.
+        # The runner provider injects HV_BUILDKIT_HOST and HV_BUILDKIT_TLS_DIR
+        # on Patdown runners only. They are process environment, which the
+        # `env` expression context does not include, so read them here.
+        lion_buildx() {
+          local endpoint="${HV_BUILDKIT_HOST:-}" tls="${HV_BUILDKIT_TLS_DIR:-}"
+          # Not a Patdown runner (e.g. Landgraf) or no client identity: do nothing.
+          [ -n "$endpoint" ] && [ -n "$tls" ] || return 0
+          local f
+          for f in ca.pem cert.pem key.pem; do
+            if ! [ -r "$tls/$f" ] || ! [ -s "$tls/$f" ]; then
+              echo "lion-buildx: falling back to the local builder ($f missing or unreadable)"
+              return 0
+            fi
+          done
+
+          local address="${endpoint#tcp://}"
+          local host="${address%:*}" port="${address##*:}"
+          local name="lion-buildkit-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}-$$"
+
+          fallback() {
+            echo "lion-buildx: falling back to the local builder ($1)"
+            timeout 10 docker buildx rm --force "$name" >/dev/null 2>&1
+            return 0
+          }
+
+          command -v timeout >/dev/null 2>&1 || { fallback "timeout not available"; return 0; }
+          command -v docker >/dev/null 2>&1 || { fallback "docker not available"; return 0; }
+          [ -n "$host" ] && [ -n "$port" ] && [ "$host" != "$address" ] \
+            || { fallback "unparseable endpoint"; return 0; }
+
+          # shellcheck disable=SC2016  # $1/$2 expand in the child shell
+          timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1 \
+            || { fallback "endpoint did not answer within 5s"; return 0; }
+
+          local err
+          err=$(timeout 30 docker buildx create --name "$name" --driver remote \
+            --driver-opt "cacert=$tls/ca.pem,cert=$tls/cert.pem,key=$tls/key.pem" \
+            "$endpoint" 2>&1 >/dev/null) \
+            || { fallback "could not create the remote builder: ${err##*$'\n'}"; return 0; }
+
+          # Proves the mTLS handshake and a live worker before anything depends on it.
+          err=$(timeout 30 docker buildx inspect --bootstrap "$name" 2>&1 >/dev/null) \
+            || { fallback "remote builder did not bootstrap: ${err##*$'\n'}"; return 0; }
+
+          err=$(timeout 15 docker buildx use "$name" 2>&1 >/dev/null) \
+            || { fallback "could not select the remote builder: ${err##*$'\n'}"; return 0; }
+
+          echo "builder=$name" >> "$GITHUB_OUTPUT"
+          echo "lion-buildx: using lion's BuildKit at $endpoint (builder $name)"
+          return 0
+        }
+        lion_buildx || true
+        exit 0
