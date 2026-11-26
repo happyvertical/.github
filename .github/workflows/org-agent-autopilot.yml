@@ -62,7 +62,7 @@ concurrency:
 jobs:
   implement:
     if: "${{ inputs.action == 'labeled' && inputs.label_name == 'dispatch: claude' }}"
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'arc-happyvertical' }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Check Issue State
